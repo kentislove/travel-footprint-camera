@@ -1,4 +1,4 @@
-/* 旅遊足跡相機 (v3) 專業相機風格樣式 */
+/* 旅遊足跡相機 (v4) - 專為行動裝置狀態列與鏡頭相容性設計 */
 * {
   box-sizing: border-box;
   margin: 0;
@@ -7,40 +7,43 @@
   user-select: none;
 }
 
-body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft JhengHei", sans-serif;
+/* 使用 100dvh (動態視窗高度) 確保不會被瀏覽器網址列或系統手勢列擠壓 */
+html, body {
+  height: 100%;
+  height: 100dvh;
+  width: 100vw;
   background-color: #000;
   color: #f0f0f0;
   overflow: hidden;
-  height: 100vh;
-  width: 100vw;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft JhengHei", sans-serif;
 }
 
 .app-container {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
+  height: 100dvh;
   max-width: 600px;
   margin: 0 auto;
   position: relative;
-  background: #121212;
+  background: #111;
 }
 
-/* 頂部功能導航列 */
+/* 頂部功能列 */
 .top-bar {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 10px 16px;
-  background: rgba(24, 24, 24, 0.95);
-  border-bottom: 1px solid #2a2a2a;
+  background: rgba(20, 20, 20, 0.98);
+  border-bottom: 1px solid #282828;
   z-index: 20;
 }
 
 .title-section {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .app-icon {
@@ -49,9 +52,18 @@ body {
 
 .app-title {
   font-size: 1.05rem;
-  font-weight: 600;
+  font-weight: 700;
   color: #fff;
-  letter-spacing: 0.5px;
+}
+
+.version-tag {
+  font-size: 0.72rem;
+  background: #2ed573;
+  color: #111;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-weight: 800;
+  margin-left: 4px;
 }
 
 .top-actions {
@@ -60,18 +72,18 @@ body {
 }
 
 .icon-button {
-  background: #2a2a2a;
+  background: #262626;
   color: #eee;
-  border: 1px solid #3d3d3d;
+  border: 1px solid #3a3a3a;
   padding: 6px 12px;
   border-radius: 20px;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   cursor: pointer;
   transition: all 0.2s;
 }
 
 .icon-button:active {
-  background: #3e3e3e;
+  background: #383838;
   transform: scale(0.95);
 }
 
@@ -80,7 +92,7 @@ body {
   display: flex;
   align-items: center;
   padding: 6px 16px;
-  background: #181818;
+  background: #1a1a1a;
   border-bottom: 1px solid #262626;
   z-index: 20;
 }
@@ -94,9 +106,9 @@ body {
 .trip-input {
   flex: 1;
   background: #242424;
-  border: 1px solid #3a3a3a;
+  border: 1px solid #383838;
   color: #fff;
-  padding: 5px 10px;
+  padding: 6px 10px;
   border-radius: 6px;
   font-size: 0.85rem;
   outline: none;
@@ -109,8 +121,8 @@ body {
 /* 即時定位狀態卡片 */
 .status-card {
   padding: 6px 16px;
-  background: #16202a;
-  border-bottom: 1px solid #20303e;
+  background: #131c24;
+  border-bottom: 1px solid #1c2b38;
   font-size: 0.8rem;
   z-index: 20;
 }
@@ -153,21 +165,23 @@ body {
   text-overflow: ellipsis;
 }
 
-/* 主要相機觀景窗區域 */
+/* 主要觀景窗區域 */
 .viewport-area {
   flex: 1;
   position: relative;
-  background-color: #000;
+  background-color: #050505;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  min-height: 0; /* 防止 flex 項目溢出 */
 }
 
 .camera-stream {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  background-color: #000;
 }
 
 /* 九宮格輔助構圖線 */
@@ -186,19 +200,10 @@ body {
   background-color: rgba(255, 255, 255, 0.12);
 }
 
-.grid-line.horizontal {
-  width: 100%;
-  height: 1px;
-}
-
+.grid-line.horizontal { width: 100%; height: 1px; }
 .grid-line.horizontal.h1 { top: 33.33%; }
 .grid-line.horizontal.h2 { top: 66.66%; }
-
-.grid-line.vertical {
-  height: 100%;
-  width: 1px;
-}
-
+.grid-line.vertical { height: 100%; width: 1px; }
 .grid-line.vertical.v1 { left: 33.33%; }
 .grid-line.vertical.v2 { left: 66.66%; }
 
@@ -209,40 +214,45 @@ body {
   left: 0;
   width: 100%;
   height: 100%;
-  background: rgba(18, 18, 18, 0.92);
+  background: rgba(14, 14, 14, 0.95);
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 30px;
+  padding: 24px;
   text-align: center;
-  z-index: 5;
+  z-index: 10;
 }
 
 .prompt-icon {
-  font-size: 3rem;
+  font-size: 3.2rem;
   margin-bottom: 12px;
 }
 
 .prompt-title {
-  font-size: 1.15rem;
-  font-weight: 600;
+  font-size: 1.2rem;
+  font-weight: 700;
   color: #fff;
   margin-bottom: 8px;
 }
 
 .prompt-desc {
-  font-size: 0.85rem;
-  color: #aaa;
-  margin-bottom: 20px;
+  font-size: 0.88rem;
+  color: #bbb;
+  margin-bottom: 22px;
   line-height: 1.5;
+  max-width: 320px;
 }
 
 .prompt-btn {
-  max-width: 220px;
+  max-width: 250px;
+  padding: 12px 20px;
+  font-size: 1rem;
+  border-radius: 30px;
+  box-shadow: 0 4px 15px rgba(46, 213, 115, 0.4);
 }
 
-/* 快門閃白光特效 */
+/* 快門閃爍白光 */
 .shutter-flash {
   position: absolute;
   top: 0;
@@ -275,7 +285,7 @@ body {
 
 .preview-tabs {
   display: flex;
-  background: #222;
+  background: #202020;
   padding: 6px;
   gap: 8px;
 }
@@ -322,15 +332,17 @@ body {
   border-top: 1px solid #333;
 }
 
-/* 底部操作控制列 */
+/* 底部操作控制列 (特別增加底邊距，徹底避開 Android 虛擬狀態列與導航條) */
 .bottom-controls {
-  padding: 16px 20px 24px 20px;
+  padding: 14px 20px;
+  padding-bottom: calc(24px + env(safe-area-inset-bottom, 20px));
   background: #181818;
   display: flex;
   align-items: center;
   justify-content: space-around;
-  border-top: 1px solid #2a2a2a;
+  border-top: 1px solid #282828;
   z-index: 20;
+  flex-shrink: 0;
 }
 
 /* 大快門按鈕 */
@@ -352,7 +364,7 @@ body {
   justify-content: center;
   background: transparent;
   transition: all 0.12s ease-in-out;
-  box-shadow: 0 0 15px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 0 16px rgba(0, 0, 0, 0.7);
 }
 
 .shutter-inner {
@@ -363,16 +375,10 @@ body {
   transition: all 0.12s ease-in-out;
 }
 
-.shutter-button:active .shutter-outer {
-  transform: scale(0.92);
-}
+.shutter-button:active .shutter-outer { transform: scale(0.92); }
+.shutter-button:active .shutter-inner { background: #ff6b81; transform: scale(0.88); }
 
-.shutter-button:active .shutter-inner {
-  background: #ff6b81;
-  transform: scale(0.88);
-}
-
-/* 左右輔助功能按鈕 */
+/* 左右側邊按鈕 */
 .side-control-btn {
   display: flex;
   flex-direction: column;
@@ -382,7 +388,7 @@ body {
   border: none;
   color: #bbb;
   cursor: pointer;
-  padding: 6px 10px;
+  padding: 8px 12px;
   border-radius: 8px;
   transition: all 0.2s;
 }
@@ -392,14 +398,8 @@ body {
   transform: scale(0.95);
 }
 
-.control-icon {
-  font-size: 1.4rem;
-}
-
-.control-text {
-  font-size: 0.72rem;
-  color: #aaa;
-}
+.control-icon { font-size: 1.45rem; }
+.control-text { font-size: 0.75rem; color: #aaa; }
 
 /* 通用按鈕 */
 .btn {
@@ -413,23 +413,10 @@ body {
   transition: all 0.2s;
 }
 
-.primary-btn {
-  background: #2ed573;
-  color: #111;
-}
-
-.primary-btn:active {
-  background: #26af5f;
-}
-
-.secondary-btn {
-  background: #333;
-  color: #eee;
-}
-
-.secondary-btn:active {
-  background: #444;
-}
+.primary-btn { background: #2ed573; color: #111; }
+.primary-btn:active { background: #26af5f; }
+.secondary-btn { background: #333; color: #eee; }
+.secondary-btn:active { background: #444; }
 
 /* 彈窗樣式 */
 .modal-overlay {
@@ -438,7 +425,7 @@ body {
   left: 0;
   width: 100%;
   height: 100%;
-  background: rgba(0, 0, 0, 0.78);
+  background: rgba(0, 0, 0, 0.8);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -463,30 +450,10 @@ body {
   border-bottom: 1px solid #333;
 }
 
-.modal-header h2 {
-  font-size: 1.1rem;
-  color: #fff;
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  color: #aaa;
-  font-size: 1.5rem;
-  cursor: pointer;
-}
-
-.modal-body {
-  padding: 16px 18px;
-}
-
-.modal-desc {
-  font-size: 0.85rem;
-  color: #bbb;
-  margin-bottom: 10px;
-  line-height: 1.4;
-}
-
+.modal-header h2 { font-size: 1.1rem; color: #fff; }
+.close-btn { background: none; border: none; color: #aaa; font-size: 1.5rem; cursor: pointer; }
+.modal-body { padding: 16px 18px; }
+.modal-desc { font-size: 0.85rem; color: #bbb; margin-bottom: 10px; line-height: 1.4; }
 .modal-input {
   width: 100%;
   background: #161616;
@@ -505,11 +472,7 @@ body {
   margin-bottom: 14px;
 }
 
-.switch-label {
-  font-size: 0.9rem;
-  color: #eee;
-}
-
+.switch-label { font-size: 0.9rem; color: #eee; }
 .tips-box {
   background: #1b2631;
   border-left: 3px solid #2ed573;
@@ -527,14 +490,14 @@ body {
   justify-content: flex-end;
 }
 
-/* 載入中遮罩 */
+/* 讀取中全螢幕遮罩 */
 .loading-overlay {
   position: fixed;
   top: 0;
   left: 0;
   width: 100%;
   height: 100%;
-  background: rgba(0, 0, 0, 0.82);
+  background: rgba(0, 0, 0, 0.85);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -561,11 +524,5 @@ body {
   animation: spin 0.8s linear infinite;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.loading-text {
-  font-size: 0.9rem;
-  color: #fff;
-}
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-text { font-size: 0.9rem; color: #fff; }
