@@ -2,8 +2,8 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>旅遊足跡隨手拍 - 雙圖自動同步相機</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>旅遊足跡隨手拍 - 雙圖自動同步相機 (v3)</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -14,7 +14,10 @@
         <span class="app-icon">📷</span>
         <h1 class="app-title">旅遊足跡相機</h1>
       </div>
-      <button id="btnSettings" class="icon-button" title="設定 Google 雲端硬碟網址">⚙️ 設定</button>
+      <div class="top-actions">
+        <button id="btnSwitchCamera" class="icon-button" title="切換前後鏡頭">🔄 翻轉</button>
+        <button id="btnSettings" class="icon-button" title="設定 Google 雲端硬碟網址">⚙️ 設定</button>
+      </div>
     </header>
 
     <!-- 旅遊行程標題自訂列 -->
@@ -33,11 +36,30 @@
     </div>
 
     <!-- 主要相機取景與照片預覽區域 -->
-    <main class="viewport-area">
-      <!-- 視訊即時預覽模式（網頁取景） -->
+    <main class="viewport-area" id="viewportArea">
+      <!-- 視訊即時預覽（相機畫面） -->
       <video id="cameraVideo" autoplay playsinline muted class="camera-stream"></video>
 
-      <!-- 拍照完成後的檢視畫布 (隱藏，用於生成雙版本照片) -->
+      <!-- 九宮格構圖輔助線 -->
+      <div class="grid-overlay">
+        <div class="grid-line horizontal h1"></div>
+        <div class="grid-line horizontal h2"></div>
+        <div class="grid-line vertical v1"></div>
+        <div class="grid-line vertical v2"></div>
+      </div>
+
+      <!-- 相機未啟動時的友善提示遮罩 -->
+      <div id="cameraPromptOverlay" class="camera-prompt-overlay" style="display: none;">
+        <div class="prompt-icon">📷</div>
+        <div class="prompt-title">相機畫面準備中</div>
+        <div class="prompt-desc">若瀏覽器出現「允許存取相機」提示，請點選「允許」喔！</div>
+        <button id="btnStartCameraManual" class="btn primary-btn prompt-btn">點我立即啟動相機</button>
+      </div>
+
+      <!-- 快門閃光效果層 -->
+      <div id="shutterFlash" class="shutter-flash"></div>
+
+      <!-- 拍照完成後的檢視畫布 (隱藏) -->
       <canvas id="cleanCanvas" style="display: none;"></canvas>
       <canvas id="stampedCanvas" style="display: none;"></canvas>
 
@@ -51,26 +73,34 @@
           <img id="previewImg" src="" alt="照片預覽" class="preview-img">
         </div>
         <div class="preview-actions">
-          <button id="btnRetake" class="btn secondary-btn">🔄 重拍一張</button>
-          <button id="btnSaveLocal" class="btn secondary-btn">💾 存到手機</button>
-          <button id="btnUploadCloud" class="btn primary-btn">☁️ 立即同步雲端</button>
+          <button id="btnRetake" class="btn secondary-btn">🔄 繼續拍</button>
+          <button id="btnSaveLocal" class="btn secondary-btn">💾 存手機</button>
+          <button id="btnUploadCloud" class="btn primary-btn">☁️ 同步雲端</button>
         </div>
       </div>
     </main>
 
     <!-- 底部拍照控制列 -->
     <footer class="bottom-controls" id="cameraControls">
-      <!-- 原生高畫質快門（相容性最佳，全解析度） -->
-      <label for="nativeCameraInput" class="shutter-label" title="點擊拍照">
+      <!-- 左側：系統相簿/原生相機備用按鈕 -->
+      <label for="nativeCameraInput" class="side-control-btn" title="從手機相簿或原生相機開啟">
+        <span class="control-icon">🖼️</span>
+        <span class="control-text">相簿/原生</span>
+      </label>
+      <input type="file" id="nativeCameraInput" accept="image/*" style="display: none;">
+
+      <!-- 中間：即時取景大快門按鈕 -->
+      <button id="btnCapture" class="shutter-button" title="按下快門拍照">
         <div class="shutter-outer">
           <div class="shutter-inner"></div>
         </div>
-        <span class="shutter-text">快門拍照</span>
-      </label>
-      <input type="file" id="nativeCameraInput" accept="image/*" capture="environment" style="display: none;">
+      </button>
 
-      <!-- 即時取景快門（網頁即時截圖） -->
-      <button id="btnWebcamShutter" class="mini-control-btn" title="切換鏡頭取景">🎥 即時畫面</button>
+      <!-- 右側：重新整理定位按鈕 -->
+      <button id="btnRefreshGps" class="side-control-btn" title="重新抓取目前位置">
+        <span class="control-icon">📍</span>
+        <span class="control-text">重整定位</span>
+      </button>
     </footer>
 
     <!-- 設定對話框 (彈出視窗) -->
@@ -82,18 +112,18 @@
         </div>
         <div class="modal-body">
           <p class="modal-desc">
-            請輸入您在 Google 雲端硬碟建立的專屬接收小幫手 (Google Apps Script) 網址：
+            Google 雲端硬碟專屬接收小幫手 (Google Apps Script) 網址：
           </p>
           <input type="url" id="gasUrlInput" class="modal-input" placeholder="https://script.google.com/macros/s/.../exec">
           
           <div class="switch-row">
-            <label class="switch-label">拍完照自動上傳：</label>
+            <label class="switch-label">拍完照自動同步雲端：</label>
             <input type="checkbox" id="autoUploadCheck" checked>
           </div>
 
           <div class="tips-box">
             <p>💡 <b>老師貼心叮嚀：</b></p>
-            <p>只要設定一次，網頁就會自動記住。出門在外每按一次快門，就會自動幫您同時打包傳送「純淨原圖」與「打卡印章圖」！</p>
+            <p>已為您預設填入您個人部署的 Google 接收小幫手。每按下一次快門，系統就會自動將「純淨原圖」與「打卡印章圖」同步送達您的雲端硬碟！</p>
           </div>
         </div>
         <div class="modal-footer">

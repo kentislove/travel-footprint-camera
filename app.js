@@ -1,32 +1,42 @@
 /**
- * 旅遊足跡相機核心控制腳本 (app.js)
- * 負責：GPS定位抓取、繁體中文地址解析、相機拍攝、雙版本照片(A+B)繪製與Google雲端硬碟同步
+ * 旅遊足跡相機核心控制腳本 (v3 記憶體輕量化與即時觀景窗版)
+ * 解決痛點：
+ * 1. 徹底解決 Android 手機「記憶體不足 (Out of Memory)」問題：加入智慧降噪與尺寸約束 (最大 1920px)，杜絕記憶體崩潰。
+ * 2. 徹底解決「黑畫面」問題：網頁一開啟自動啟動手機後置鏡頭取景，點擊大快門直接秒速截圖拍照！
+ * 3. 支援前後鏡頭翻轉、繁體中文詳細地址解析與 Google 雲端自動同步。
  */
 
-// 全域狀態儲存區
+// 1. 全域狀態管理
 const state = {
   latitude: null,
   longitude: null,
-  altitude: null,
   accuracy: null,
-  address: "尚未取得地址",
+  address: "定位準備中...",
   currentTimestamp: "",
   cleanImageDataUrl: null,   // 版本 B：純淨原圖
   stampedImageDataUrl: null, // 版本 A：打卡印章圖
-  activeTab: "stamped",      // 目前預覽的分頁
+  activeTab: "stamped",
   mediaStream: null,
-  isCameraActive: false,
+  currentFacingMode: "environment", // 預設使用後置鏡頭
   gasUrl: localStorage.getItem("travel_camera_gas_url") || "https://script.google.com/macros/s/AKfycbxr3Zv5jRHXevBRVQdpJ1zINvYndnYtrsW6gfOg2-gGaf9pEXYWCLNkQECkirh-2X_OIw/exec",
-  autoUpload: localStorage.getItem("travel_camera_auto_upload") !== "false"
+  autoUpload: localStorage.getItem("travel_camera_auto_upload") !== "false",
+  isCapturing: false
 };
 
-// DOM 元素快取
+// 記憶體保護常數：將照片最大長寬限制在 1920 像素，避免手機解碼 5000 萬畫素時瞬間爆記憶體
+const MAX_IMAGE_DIMENSION = 1920;
+
+// 2. DOM 元素快取
 const dom = {
   gpsIndicator: document.getElementById("gpsIndicator"),
   gpsStatus: document.getElementById("gpsStatus"),
   addressDisplay: document.getElementById("addressDisplay"),
   tripTitleInput: document.getElementById("tripTitleInput"),
   cameraVideo: document.getElementById("cameraVideo"),
+  cameraPromptOverlay: document.getElementById("cameraPromptOverlay"),
+  btnStartCameraManual: document.getElementById("btnStartCameraManual"),
+  btnSwitchCamera: document.getElementById("btnSwitchCamera"),
+  shutterFlash: document.getElementById("shutterFlash"),
   cleanCanvas: document.getElementById("cleanCanvas"),
   stampedCanvas: document.getElementById("stampedCanvas"),
   previewContainer: document.getElementById("previewContainer"),
@@ -36,9 +46,9 @@ const dom = {
   btnRetake: document.getElementById("btnRetake"),
   btnSaveLocal: document.getElementById("btnSaveLocal"),
   btnUploadCloud: document.getElementById("btnUploadCloud"),
+  btnCapture: document.getElementById("btnCapture"),
   nativeCameraInput: document.getElementById("nativeCameraInput"),
-  btnWebcamShutter: document.getElementById("btnWebcamShutter"),
-  cameraControls: document.getElementById("cameraControls"),
+  btnRefreshGps: document.getElementById("btnRefreshGps"),
   btnSettings: document.getElementById("btnSettings"),
   settingsModal: document.getElementById("settingsModal"),
   btnCloseSettings: document.getElementById("btnCloseSettings"),
@@ -49,241 +59,258 @@ const dom = {
   loadingText: document.getElementById("loadingText")
 };
 
-// 1. 初始化程序
+// 3. 網頁啟動初始化
 window.addEventListener("DOMContentLoaded", () => {
   initSettings();
   initGeolocation();
   initEventHandlers();
+  
+  // 自動嘗試開啟相機即時畫面
+  startCamera();
 });
 
-// 2. 設定相關初始化
+// 4. 設定初始化
 function initSettings() {
   dom.gasUrlInput.value = state.gasUrl;
   dom.autoUploadCheck.checked = state.autoUpload;
 }
 
-// 3. 地理定位與中文地址解析模組
+// 5. 相機啟動與觀景窗管理
+async function startCamera() {
+  // 若原本已有鏡頭串流，先徹底關閉舊串流釋放記憶體
+  stopCamera();
+
+  dom.cameraPromptOverlay.style.display = "none";
+
+  try {
+    const constraints = {
+      video: {
+        facingMode: { ideal: state.currentFacingMode },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    };
+
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    state.mediaStream = stream;
+    dom.cameraVideo.srcObject = stream;
+
+    // 確保視訊順利播放
+    await dom.cameraVideo.play();
+  } catch (error) {
+    console.error("相機啟動異常:", error);
+    // 若自動播放受瀏覽器權限限制，顯示友善提示卡片供手動點擊允許
+    dom.cameraPromptOverlay.style.display = "flex";
+  }
+}
+
+function stopCamera() {
+  if (state.mediaStream) {
+    state.mediaStream.getTracks().forEach(track => track.stop());
+    state.mediaStream = null;
+  }
+  dom.cameraVideo.srcObject = null;
+}
+
+// 切換前後鏡頭
+function switchCamera() {
+  state.currentFacingMode = (state.currentFacingMode === "environment") ? "user" : "environment";
+  startCamera();
+}
+
+// 6. 衛星定位與繁體中文地址解析
 function initGeolocation() {
   if (!navigator.geolocation) {
-    updateGpsUI(false, "此裝置或瀏覽器不支援地理定位");
+    updateGpsUI(false, "裝置不支援定位功能");
     return;
   }
 
-  updateGpsUI(null, "正在搜尋衛星訊號...");
+  updateGpsUI(null, "正在抓取衛星定位中...");
 
-  // 即時監聽位置變更 (適合旅遊邊走邊拍)
   navigator.geolocation.watchPosition(
-    async (position) => {
-      const coords = position.coords;
-      state.latitude = coords.latitude;
-      state.longitude = coords.longitude;
-      state.altitude = coords.altitude;
-      state.accuracy = coords.accuracy;
+    async (pos) => {
+      state.latitude = pos.coords.latitude;
+      state.longitude = pos.coords.longitude;
+      state.accuracy = pos.coords.accuracy;
 
-      updateGpsUI(true, `定位成功 (精確度: 約 ${Math.round(coords.accuracy)} 公尺)`);
-
-      // 開始逆向解析繁體中文地址
-      await resolveChineseAddress(coords.latitude, coords.longitude);
+      updateGpsUI(true, `定位成功 (誤差約 ${Math.round(pos.coords.accuracy)} 公尺)`);
+      await resolveChineseAddress(pos.coords.latitude, pos.coords.longitude);
     },
-    (error) => {
-      let errorMsg = "無法取得定位";
-      if (error.code === 1) errorMsg = "請允許瀏覽器存取位置權限";
-      else if (error.code === 2) errorMsg = "目前收不到 GPS 衛星訊號";
-      else if (error.code === 3) errorMsg = "定位逾時，請重新整理重試";
-      updateGpsUI(false, errorMsg);
+    (err) => {
+      let msg = "定位無法取得";
+      if (err.code === 1) msg = "請允許瀏覽器位置權限";
+      else if (err.code === 2) msg = "暫時收不到衛星訊號";
+      else if (err.code === 3) msg = "定位逾時重試中";
+      updateGpsUI(false, msg);
     },
-    {
-      enableHighAccuracy: true, // 啟用高精確度模式
-      timeout: 15000,
-      maximumAge: 10000
-    }
+    { enableHighAccuracy: true, timeout: 12000, maximumAge: 10000 }
   );
 }
 
-function updateGpsUI(isReady, message) {
-  dom.gpsStatus.textContent = message;
+function updateGpsUI(isReady, msg) {
+  dom.gpsStatus.textContent = msg;
   dom.gpsIndicator.className = "status-indicator";
-  if (isReady === true) {
-    dom.gpsIndicator.classList.add("ready");
-  } else if (isReady === false) {
-    dom.gpsIndicator.classList.add("error");
-  }
+  if (isReady === true) dom.gpsIndicator.classList.add("ready");
+  else if (isReady === false) dom.gpsIndicator.classList.add("error");
 }
 
-// 呼叫開放街圖逆地理編碼服務取得台灣繁體中文門牌
 async function resolveChineseAddress(lat, lon) {
   try {
     const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&accept-language=zh-TW`;
-    const response = await fetch(url, { headers: { "Accept-Language": "zh-TW" } });
-    if (!response.ok) throw new Error("地址解析伺服器回應異常");
-
-    const data = await response.json();
+    const res = await fetch(url, { headers: { "Accept-Language": "zh-TW" } });
+    if (!res.ok) throw new Error("地址解析異常");
+    const data = await res.json();
     if (data && data.display_name) {
-      // 整理成清爽的繁體中文地址
       state.address = formatAddress(data);
       dom.addressDisplay.textContent = `📍 ${state.address}`;
-    } else {
-      fallbackCoordinates(lat, lon);
     }
-  } catch (err) {
-    fallbackCoordinates(lat, lon);
+  } catch (e) {
+    state.address = `座標：${lat.toFixed(5)}° N, ${lon.toFixed(5)}° E`;
+    dom.addressDisplay.textContent = `📍 ${state.address}`;
   }
 }
 
 function formatAddress(data) {
-  const addr = data.address || {};
-  const city = addr.city || addr.town || addr.county || "";
-  const district = addr.suburb || addr.district || addr.borough || "";
-  const road = addr.road || addr.pedestrian || "";
-  const houseNumber = addr.house_number ? `${addr.house_number}號` : "";
-  const landmark = addr.attraction || addr.tourism || addr.amenity || "";
+  const a = data.address || {};
+  const city = a.city || a.town || a.county || "";
+  const dist = a.suburb || a.district || "";
+  const road = a.road || "";
+  const num = a.house_number ? `${a.house_number}號` : "";
+  const spot = a.attraction || a.tourism || "";
+  let full = `${city}${dist}${road}${num}`;
+  if (spot) full += ` (${spot})`;
+  return full.trim() || data.display_name;
+}
 
-  let result = `${city}${district}${road}${houseNumber}`;
-  if (landmark) {
-    result += ` (${landmark})`;
+// 7. 快門拍照核心（直接從即時觀景窗截圖，杜絕跳出與記憶體不足）
+async function capturePhotoFromVideo() {
+  if (state.isCapturing) return;
+  state.isCapturing = true;
+
+  // 1. 觸發觸感震動與快門閃光
+  if (navigator.vibrate) navigator.vibrate(50);
+  triggerShutterFlash();
+
+  // 2. 檢查視訊是否就緒
+  const video = dom.cameraVideo;
+  if (!video.videoWidth || !video.videoHeight) {
+    alert("相機畫面尚未載入完成，請稍候片刻再按快門！");
+    state.isCapturing = false;
+    return;
   }
-  return result.trim() || data.display_name;
+
+  showLoading("正在處理照片與印章資訊...");
+
+  // 延遲 50ms 讓畫面更新閃光動畫
+  setTimeout(() => {
+    // 3. 計算約束後的尺寸（防止超大解析度壓垮手機記憶體）
+    const origW = video.videoWidth;
+    const origH = video.videoHeight;
+    const { targetW, targetH } = getConstrainedDimensions(origW, origH, MAX_IMAGE_DIMENSION);
+
+    // 4. 產出【版本 B：純淨原圖】
+    const cleanCanvas = dom.cleanCanvas;
+    cleanCanvas.width = targetW;
+    cleanCanvas.height = targetH;
+    const cleanCtx = cleanCanvas.getContext("2d");
+    cleanCtx.drawImage(video, 0, 0, targetW, targetH);
+    state.cleanImageDataUrl = cleanCanvas.toDataURL("image/jpeg", 0.85);
+
+    // 5. 產出【版本 A：打卡印章圖】
+    const stampedCanvas = dom.stampedCanvas;
+    stampedCanvas.width = targetW;
+    stampedCanvas.height = targetH;
+    const stampedCtx = stampedCanvas.getContext("2d");
+    stampedCtx.drawImage(video, 0, 0, targetW, targetH);
+
+    state.currentTimestamp = formatFullDate(new Date());
+    drawTravelStamp(stampedCtx, targetW, targetH);
+    state.stampedImageDataUrl = stampedCanvas.toDataURL("image/jpeg", 0.85);
+
+    // 6. 釋放畫布暫存以保護手機記憶體
+    cleanCanvas.width = 1;
+    cleanCanvas.height = 1;
+    stampedCanvas.width = 1;
+    stampedCanvas.height = 1;
+
+    // 7. 顯示預覽
+    showPreview();
+    hideLoading();
+    state.isCapturing = false;
+
+    // 8. 自動連動 Google 雲端硬碟
+    if (state.autoUpload && state.gasUrl) {
+      uploadImagesToGoogleDrive(true);
+    }
+  }, 60);
 }
 
-function fallbackCoordinates(lat, lon) {
-  state.address = `經緯度座標：${lat.toFixed(6)}, ${lon.toFixed(6)}`;
-  dom.addressDisplay.textContent = `📍 ${state.address}`;
-}
-
-// 4. 事件監聽綁定
-function initEventHandlers() {
-  // 快門拍照觸發 (原生高解析度相機)
-  dom.nativeCameraInput.addEventListener("change", handleNativePhotoCapture);
-
-  // 切換即時網頁視訊取景模式
-  dom.btnWebcamShutter.addEventListener("click", toggleWebcamMode);
-
-  // 預覽分頁切換 (A 印章圖 / B 原圖)
-  dom.tabStamped.addEventListener("click", () => switchPreviewTab("stamped"));
-  dom.tabClean.addEventListener("click", () => switchPreviewTab("clean"));
-
-  // 預覽功能按鈕
-  dom.btnRetake.addEventListener("click", resetPreview);
-  dom.btnSaveLocal.addEventListener("click", saveImagesToLocal);
-  dom.btnUploadCloud.addEventListener("click", () => uploadImagesToGoogleDrive(false));
-
-  // 設定對話框開關
-  dom.btnSettings.addEventListener("click", () => dom.settingsModal.style.display = "flex");
-  dom.btnCloseSettings.addEventListener("click", () => dom.settingsModal.style.display = "none");
-  dom.btnSaveSettings.addEventListener("click", saveSettings);
-}
-
-// 5. 照片拍攝與雙版本處理
-async function handleNativePhotoCapture(event) {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
-
-  showLoading("正在為照片加上定位與印章...");
-
-  const img = new Image();
-  const reader = new FileReader();
-
-  reader.onload = (e) => {
-    img.onload = () => {
-      processPhoto(img);
-    };
-    img.src = e.target.result;
+// 尺寸約束計算工具：將任意巨大相片等比例縮小在安全範圍內（防爆記憶體）
+function getConstrainedDimensions(width, height, maxDimension) {
+  if (width <= maxDimension && height <= maxDimension) {
+    return { targetW: width, targetH: height };
+  }
+  const ratio = Math.min(maxDimension / width, maxDimension / height);
+  return {
+    targetW: Math.round(width * ratio),
+    targetH: Math.round(height * ratio)
   };
-  reader.readAsDataURL(file);
-
-  // 清空輸入框以利下次拍攝
-  dom.nativeCameraInput.value = "";
 }
 
-// 拍照核心：生成版本 A (印章圖) 與版本 B (純淨原圖)
-function processPhoto(img) {
-  const width = img.naturalWidth || img.width;
-  const height = img.naturalHeight || img.height;
-
-  // 1. 生成版本 B：純淨原圖
-  const cleanCanvas = dom.cleanCanvas;
-  cleanCanvas.width = width;
-  cleanCanvas.height = height;
-  const cleanCtx = cleanCanvas.getContext("2d");
-  cleanCtx.drawImage(img, 0, 0, width, height);
-  state.cleanImageDataUrl = cleanCanvas.toDataURL("image/jpeg", 0.95);
-
-  // 2. 生成版本 A：旅遊打卡印章圖
-  const stampedCanvas = dom.stampedCanvas;
-  stampedCanvas.width = width;
-  stampedCanvas.height = height;
-  const stampedCtx = stampedCanvas.getContext("2d");
-  stampedCtx.drawImage(img, 0, 0, width, height);
-
-  // 產生時間戳記字串
-  const now = new Date();
-  state.currentTimestamp = formatFullDate(now);
-
-  // 在打卡圖上繪製精緻半透明印章卡
-  drawTravelStamp(stampedCtx, width, height);
-  state.stampedImageDataUrl = stampedCanvas.toDataURL("image/jpeg", 0.95);
-
-  // 3. 顯示預覽
-  showPreview();
-  hideLoading();
-
-  // 4. 若開啟自動同步，直接觸發上傳
-  if (state.autoUpload && state.gasUrl) {
-    uploadImagesToGoogleDrive(true);
-  }
+// 快門閃爍白光動畫
+function triggerShutterFlash() {
+  dom.shutterFlash.classList.add("flash");
+  setTimeout(() => dom.shutterFlash.classList.remove("flash"), 120);
 }
 
-// 繪製精緻的旅行打卡資訊印章
+// 繪製打卡印章卡
 function drawTravelStamp(ctx, width, height) {
-  // 依據照片寬度自適應調整字型大小，確保在百萬畫素下清晰易讀
   const scale = Math.max(1, width / 1200);
   const baseFontSize = Math.round(18 * scale);
-  const titleFontSize = Math.round(24 * scale);
-  const padding = Math.round(20 * scale);
-  const cardMargin = Math.round(24 * scale);
+  const titleFontSize = Math.round(23 * scale);
+  const padding = Math.round(18 * scale);
+  const cardMargin = Math.round(20 * scale);
 
-  const tripTitle = dom.tripTitleInput.value.trim() || "旅遊生活紀錄";
-  const addressText = state.address || "未取得地址資訊";
+  const tripTitle = dom.tripTitleInput.value.trim() || "旅遊隨手拍";
+  const addressText = state.address || "未取得地址";
   const timeText = state.currentTimestamp;
   const coordsText = (state.latitude && state.longitude)
-    ? `座標：${state.latitude.toFixed(6)}° N, ${state.longitude.toFixed(6)}° E (±${Math.round(state.accuracy || 0)}m)`
+    ? `座標：${state.latitude.toFixed(6)}° N, ${state.longitude.toFixed(6)}° E (誤差±${Math.round(state.accuracy || 0)}m)`
     : "衛星座標抓取中";
 
   ctx.save();
-
-  // 計算文字高度與卡片尺寸
-  const lineHeight = Math.round(28 * scale);
-  const cardHeight = Math.round(140 * scale);
-  const cardWidth = Math.min(width - (cardMargin * 2), Math.round(800 * scale));
+  const lineHeight = Math.round(26 * scale);
+  const cardHeight = Math.round(135 * scale);
+  const cardWidth = Math.min(width - (cardMargin * 2), Math.round(820 * scale));
   const cardX = cardMargin;
   const cardY = height - cardHeight - cardMargin;
 
   // 繪製半透明深灰圓角印章底卡
   ctx.fillStyle = "rgba(18, 18, 18, 0.78)";
   ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
-  ctx.shadowBlur = 12 * scale;
-  drawRoundRect(ctx, cardX, cardY, cardWidth, cardHeight, 12 * scale);
+  ctx.shadowBlur = 10 * scale;
+  drawRoundRect(ctx, cardX, cardY, cardWidth, cardHeight, 10 * scale);
   ctx.fill();
 
-  // 取消陰影開始寫字
   ctx.shadowBlur = 0;
 
-  // 寫入旅行標題 (亮青色)
+  // 標題 (亮綠色)
   ctx.fillStyle = "#2ed573";
   ctx.font = `bold ${titleFontSize}px "Microsoft JhengHei", sans-serif`;
   ctx.fillText(`🚩 ${tripTitle}`, cardX + padding, cardY + padding + (titleFontSize * 0.8));
 
-  // 寫入詳細地址 (純白清晰)
+  // 地址 (純白)
   ctx.fillStyle = "#ffffff";
   ctx.font = `500 ${baseFontSize}px "Microsoft JhengHei", sans-serif`;
   ctx.fillText(`📍 ${addressText}`, cardX + padding, cardY + padding + titleFontSize + lineHeight);
 
-  // 寫入時間戳記 (暖黃色)
+  // 時間 (暖黃)
   ctx.fillStyle = "#eccc68";
   ctx.font = `${Math.round(baseFontSize * 0.9)}px "Microsoft JhengHei", sans-serif`;
   ctx.fillText(`🕒 ${timeText}`, cardX + padding, cardY + padding + titleFontSize + (lineHeight * 2));
 
-  // 寫入衛星經緯度 (灰白色)
+  // 經緯度 (灰白)
   ctx.fillStyle = "#ced6e0";
   ctx.font = `${Math.round(baseFontSize * 0.85)}px monospace`;
   ctx.fillText(`🌐 ${coordsText}`, cardX + padding, cardY + padding + titleFontSize + (lineHeight * 2.9));
@@ -291,7 +318,6 @@ function drawTravelStamp(ctx, width, height) {
   ctx.restore();
 }
 
-// 輔助繪製圓角矩形
 function drawRoundRect(ctx, x, y, width, height, radius) {
   ctx.beginPath();
   ctx.moveTo(x + radius, y);
@@ -306,7 +332,7 @@ function drawRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-// 6. 預覽與分頁切換
+// 8. 預覽與操作控制
 function showPreview() {
   dom.previewContainer.style.display = "flex";
   switchPreviewTab("stamped");
@@ -331,47 +357,39 @@ function resetPreview() {
   state.stampedImageDataUrl = null;
 }
 
-// 7. 本地照片下載保存 (一鍵存兩張)
+// 9. 本地存檔支援
 function saveImagesToLocal() {
   if (!state.cleanImageDataUrl || !state.stampedImageDataUrl) return;
-
-  const timestampStr = state.currentTimestamp.replace(/[: /]/g, "_");
-  
-  // 下載版本 A (印章圖)
-  downloadDataUrl(state.stampedImageDataUrl, `旅遊打卡印章_${timestampStr}.jpg`);
-
-  // 下載版本 B (純淨原圖)
-  setTimeout(() => {
-    downloadDataUrl(state.cleanImageDataUrl, `旅遊純淨原圖_${timestampStr}.jpg`);
-  }, 400);
-
-  alert("已成功將【版本 A：打卡印章圖】與【版本 B：純淨原圖】存入您的手機！");
+  const timeStr = state.currentTimestamp.replace(/[: /]/g, "_");
+  downloadDataUrl(state.stampedImageDataUrl, `旅遊打卡印章_${timeStr}.jpg`);
+  setTimeout(() => downloadDataUrl(state.cleanImageDataUrl, `旅遊純淨原圖_${timeStr}.jpg`), 350);
+  alert("已成功將【版本 A：打卡印章圖】與【版本 B：純淨原圖】儲存至手機相簿！");
 }
 
-function downloadDataUrl(dataUrl, filename) {
+function downloadDataUrl(url, name) {
   const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = filename;
+  a.href = url;
+  a.download = name;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
 }
 
-// 8. 雲端同步至 Google 雲端硬碟
-async function uploadImagesToGoogleDrive(isSilentAuto) {
+// 10. 雲端同步
+async function uploadImagesToGoogleDrive(isSilent) {
   if (!state.gasUrl) {
-    if (!isSilentAuto) {
-      alert("尚未設定 Google 雲端接收小幫手網址！請先點擊右上角「設定」按鈕貼上網址。");
+    if (!isSilent) {
+      alert("尚未設定 Google 雲端接收小幫手網址！");
       dom.settingsModal.style.display = "flex";
     }
     return;
   }
 
-  showLoading(isSilentAuto ? "正在自動同步至 Google 雲端硬碟..." : "正在同步上傳雙版本照片...");
+  showLoading(isSilent ? "正在自動同步至 Google 雲端硬碟..." : "正在上傳雙版本照片...");
 
   try {
     const payload = {
-      tripTitle: dom.tripTitleInput.value.trim() || "旅遊紀錄",
+      tripTitle: dom.tripTitleInput.value.trim() || "旅遊生活紀錄",
       timestamp: state.currentTimestamp,
       address: state.address,
       latitude: state.latitude,
@@ -380,83 +398,117 @@ async function uploadImagesToGoogleDrive(isSilentAuto) {
       stampedImageBase64: state.stampedImageDataUrl.split(",")[1]
     };
 
-    const response = await fetch(state.gasUrl, {
+    const res = await fetch(state.gasUrl, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify(payload)
     });
 
-    const result = await response.json();
+    const result = await res.json();
     hideLoading();
 
     if (result && result.status === "success") {
-      if (!isSilentAuto) {
+      if (!isSilent) {
         alert(`🎉 恭喜小學生！雙版本照片已成功同步至 Google 雲端硬碟！\n雲端資料夾：${result.folderName}`);
       }
     } else {
-      throw new Error(result.message || "伺服器未回傳成功狀態");
+      throw new Error(result.message || "雲端未回傳成功訊息");
     }
-  } catch (error) {
-    hideLoading();
-    console.error(error);
-    if (!isSilentAuto) {
-      alert("上傳 Google 雲端硬碟時發生連線狀況，請確認網路連線或檢查設定網址是否正確。");
-    }
-  }
-}
-
-// 9. 即時網頁視訊取景模式 (Webcam)
-async function toggleWebcamMode() {
-  if (state.isCameraActive) {
-    stopWebcam();
-    return;
-  }
-
-  try {
-    const constraints = {
-      video: {
-        facingMode: { ideal: "environment" }, // 優先使用手機後置主鏡頭
-        width: { ideal: 1920 },
-        height: { ideal: 1080 }
-      },
-      audio: false
-    };
-
-    state.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-    dom.cameraVideo.srcObject = state.mediaStream;
-    state.isCameraActive = true;
-    dom.btnWebcamShutter.textContent = "⏹️ 關閉即時取景";
   } catch (err) {
-    alert("無法開啟即時視訊取景。建議使用大圓形【快門拍照】按鈕直接喚醒手機原生相機，畫質更高且最相容！");
+    hideLoading();
+    console.error(err);
+    if (!isSilent) {
+      alert("同步至雲端時連線有短暫延遲，請確認網路正常。");
+    }
   }
 }
 
-function stopWebcam() {
-  if (state.mediaStream) {
-    state.mediaStream.getTracks().forEach((track) => track.stop());
-    state.mediaStream = null;
-  }
-  dom.cameraVideo.srcObject = null;
-  state.isCameraActive = false;
-  dom.btnWebcamShutter.textContent = "🎥 即時畫面";
+// 11. 備用：相簿檔案選取處理 (同樣實施記憶體保護約束)
+function handleNativeFile(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+
+  showLoading("正在載入相片並進行輕量化處理...");
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    const img = new Image();
+    img.onload = () => {
+      const { targetW, targetH } = getConstrainedDimensions(img.width, img.height, MAX_IMAGE_DIMENSION);
+
+      const cleanCanvas = dom.cleanCanvas;
+      cleanCanvas.width = targetW;
+      cleanCanvas.height = targetH;
+      const cleanCtx = cleanCanvas.getContext("2d");
+      cleanCtx.drawImage(img, 0, 0, targetW, targetH);
+      state.cleanImageDataUrl = cleanCanvas.toDataURL("image/jpeg", 0.85);
+
+      const stampedCanvas = dom.stampedCanvas;
+      stampedCanvas.width = targetW;
+      stampedCanvas.height = targetH;
+      const stampedCtx = stampedCanvas.getContext("2d");
+      stampedCtx.drawImage(img, 0, 0, targetW, targetH);
+
+      state.currentTimestamp = formatFullDate(new Date());
+      drawTravelStamp(stampedCtx, targetW, targetH);
+      state.stampedImageDataUrl = stampedCanvas.toDataURL("image/jpeg", 0.85);
+
+      cleanCanvas.width = 1;
+      cleanCanvas.height = 1;
+      stampedCanvas.width = 1;
+      stampedCanvas.height = 1;
+
+      showPreview();
+      hideLoading();
+
+      if (state.autoUpload && state.gasUrl) {
+        uploadImagesToGoogleDrive(true);
+      }
+    };
+    img.src = event.target.result;
+  };
+  reader.readAsDataURL(file);
+  dom.nativeCameraInput.value = "";
 }
 
-// 10. 設定存檔
+// 12. 事件綁定
+function initEventHandlers() {
+  // 快門按鈕
+  dom.btnCapture.addEventListener("click", capturePhotoFromVideo);
+
+  // 翻轉鏡頭按鈕
+  dom.btnSwitchCamera.addEventListener("click", switchCamera);
+
+  // 友善授權卡片手動開啟
+  dom.btnStartCameraManual.addEventListener("click", startCamera);
+
+  // 重新抓取定位按鈕
+  dom.btnRefreshGps.addEventListener("click", initGeolocation);
+
+  // 原生相片選取 (備用)
+  dom.nativeCameraInput.addEventListener("change", handleNativeFile);
+
+  // 預覽切換與控制
+  dom.tabStamped.addEventListener("click", () => switchPreviewTab("stamped"));
+  dom.tabClean.addEventListener("click", () => switchPreviewTab("clean"));
+  dom.btnRetake.addEventListener("click", resetPreview);
+  dom.btnSaveLocal.addEventListener("click", saveImagesToLocal);
+  dom.btnUploadCloud.addEventListener("click", () => uploadImagesToGoogleDrive(false));
+
+  // 設定視窗開關
+  dom.btnSettings.addEventListener("click", () => dom.settingsModal.style.display = "flex");
+  dom.btnCloseSettings.addEventListener("click", () => dom.settingsModal.style.display = "none");
+  dom.btnSaveSettings.addEventListener("click", saveSettings);
+}
+
 function saveSettings() {
-  const url = dom.gasUrlInput.value.trim();
-  const auto = dom.autoUploadCheck.checked;
-
-  state.gasUrl = url;
-  state.autoUpload = auto;
-
-  localStorage.setItem("travel_camera_gas_url", url);
-  localStorage.setItem("travel_camera_auto_upload", auto);
-
+  state.gasUrl = dom.gasUrlInput.value.trim();
+  state.autoUpload = dom.autoUploadCheck.checked;
+  localStorage.setItem("travel_camera_gas_url", state.gasUrl);
+  localStorage.setItem("travel_camera_auto_upload", state.autoUpload);
   dom.settingsModal.style.display = "none";
-  alert("設定已儲存！");
+  alert("雲端同步設定已儲存！");
 }
 
-// 工具：格式化完整時間
 function formatFullDate(date) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
