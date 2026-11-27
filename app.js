@@ -1,17 +1,16 @@
 /**
- * 旅遊足跡相機核心控制腳本 (v7 iOS 連拍修復 + 非阻塞編碼版)
+ * 旅遊足跡相機核心控制腳本 (v8 iOS 相簿存檔修復版)
  *
- * v7 相較 v6 的四大修復（專治 iPhone Chrome/Safari 無法連拍）：
- * 1. 編碼非同步化：改用 canvas.toBlob() 取代 canvas.toDataURL()，JPEG 編碼
- *    丟到瀏覽器背景執行緒，主執行緒不再阻塞，快門按下後 50ms 內即可按下一張。
- * 2. iOS 安全解析度上限：偵測 iOS 時，最大邊長壓到 2560px，避免 WebView
- *    記憶體爆掉導致鏡頭串流被系統回收。
- * 3. 每張獨立 Canvas：每次拍照都 new 一組 OffscreenCanvas / document.createElement
- *    避免 v6 單一共用 canvas 被連拍覆蓋造成資料損毀。
- * 4. applyConstraints 走 iOS 相容語法：改用 { width: { ideal } } 單層格式，
- *    不用 advanced: [{ … }]；失敗時優雅退場不影響拍照。
- * 5. 預覽改走 ObjectURL：縮圖與預覽彈窗使用 URL.createObjectURL(blob)，
- *    體積 0 且 GC 友善；base64 僅在上傳 Google Drive 那一刻才現場轉。
+ * v8 相較 v7 的三大修復（專治 iPhone）：
+ * 1. iOS 存檔改走 Web Share API：改用 navigator.share({ files: [...] })
+ *    呼叫系統原生分享表，使用者點「儲存影像」即可存入照片 App。
+ *    不再用 <a download> 連點兩下（那是 iPhone 鏡頭中斷的真兇）。
+ * 2. 關閉 iOS 的「自動下載」：iOS 根本不支援背景存相簿，自動下載只會
+ *    讓使用者每拍一張就被下載對話框打斷鏡頭。v8 在 iOS 直接忽略
+ *    autoDownload，改在設定頁顯示提示。
+ * 3. 上傳加速：縮小上傳用的 JPEG（上傳版本 1920px/0.82），和存檔版本
+ *    （原生最大/0.90）解耦；fetch 加上 timeout 與 keepalive，避免
+ *    GAS 冷啟動時卡死整個佇列。
  */
 
 const state = {
@@ -45,12 +44,19 @@ const state = {
   currentViewingPhoto: null
 };
 
-// 1. iOS / 裝置偵測與安全上限
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
               (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-const IOS_SAFE_MAX_DIM = 2560;     // iPhone WebKit 單張安全上限
-const ANDROID_SAFE_MAX_DIM = 4096; // Android Chrome 可承受更高
+const IOS_SAFE_MAX_DIM = 2560;
+const ANDROID_SAFE_MAX_DIM = 4096;
 const JPEG_QUALITY = isIOS ? 0.90 : 0.92;
+
+// v8：上傳用的縮小規格（兼顧畫質與速度）
+const UPLOAD_MAX_DIM = 1920;
+const UPLOAD_JPEG_QUALITY = 0.82;
+
+// v8：Web Share API 支援偵測
+const canShareFiles = (typeof navigator.canShare === "function") &&
+                      (typeof navigator.share === "function");
 
 const dom = {
   gpsIndicator: document.getElementById("gpsIndicator"),
@@ -105,9 +111,22 @@ function initSettings() {
   dom.gasUrlInput.value = state.gasUrl;
   dom.autoUploadCheck.checked = state.autoUpload;
   dom.autoDownloadCheck.checked = state.autoDownload;
+
+  // v8：iOS 直接鎖住自動下載選項並說明原因
+  if (isIOS) {
+    dom.autoDownloadCheck.checked = false;
+    dom.autoDownloadCheck.disabled = true;
+    state.autoDownload = false;
+    const label = dom.autoDownloadCheck.closest(".switch-row");
+    if (label) {
+      const tip = document.createElement("div");
+      tip.style.cssText = "font-size:0.8rem;color:#eccc68;margin-top:4px;line-height:1.4;";
+      tip.textContent = "📱 iPhone 無法背景自動存相簿（會中斷鏡頭）。請拍完後點縮圖→💾，從系統分享表選「儲存影像」。";
+      label.appendChild(tip);
+    }
+  }
 }
 
-// 2. 相機啟動（iOS 相容語法）
 async function startCamera() {
   stopCamera();
   let stream = null;
@@ -177,7 +196,6 @@ async function applySafeMaxResolution(track) {
     }
 
     if (maxW && maxH) {
-      // iOS 相容：走單層 ideal，不用 advanced
       await track.applyConstraints({
         width: { ideal: maxW },
         height: { ideal: maxH }
@@ -296,7 +314,6 @@ function switchCamera() {
   startCamera();
 }
 
-// 3. 定位
 function initGeolocation() {
   if (!navigator.geolocation) {
     updateGpsUI(false, "手機不支援定位功能");
@@ -357,7 +374,6 @@ function formatAddress(data) {
   return full.trim() || data.display_name;
 }
 
-// 4. ★ 核心：非阻塞連拍引擎 ★
 function capturePhotoInstantly() {
   const video = dom.cameraVideo;
   if (!video.videoWidth || !video.videoHeight) {
@@ -368,7 +384,6 @@ function capturePhotoInstantly() {
   if (navigator.vibrate) navigator.vibrate(40);
   triggerShutterFlash();
 
-  // (A) 鎖定當下所有情境資料（避免下一張覆蓋）
   const snapshot = {
     id: Date.now() + Math.random(),
     tripTitle: dom.tripTitleInput.value.trim() || "旅遊隨手拍",
@@ -381,7 +396,6 @@ function capturePhotoInstantly() {
   const origW = video.videoWidth;
   const origH = video.videoHeight;
 
-  // (B) 計算裁切窗（數位縮放時從中心取）
   const useDigitalZoom = !state.cameraCaps.supportsNativeZoom && state.currentZoom > 1.01;
   let srcX = 0, srcY = 0, srcW = origW, srcH = origH;
   if (useDigitalZoom) {
@@ -392,7 +406,6 @@ function capturePhotoInstantly() {
     srcY = Math.round((origH - srcH) / 2);
   }
 
-  // (C) ★ 每次拍照獨立 canvas，不共用，連拍不互相覆蓋 ★
   const cleanCanvas = document.createElement("canvas");
   const stampedCanvas = document.createElement("canvas");
   cleanCanvas.width = srcW;
@@ -400,33 +413,36 @@ function capturePhotoInstantly() {
   stampedCanvas.width = srcW;
   stampedCanvas.height = srcH;
 
-  // (D) 繪製（同步，但速度很快 ~5-30ms）
   cleanCanvas.getContext("2d").drawImage(video, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
   const sCtx = stampedCanvas.getContext("2d");
   sCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
   drawTravelStamp(sCtx, srcW, srcH, snapshot.tripTitle, snapshot.address, snapshot.timestamp, snapshot.latitude, snapshot.longitude);
 
-  // (E) 立即給使用者回饋 → 快門可以馬上按下一張
   const mp = ((srcW * srcH) / 1000000).toFixed(1);
   showQuickToast(`✓ 已拍下 ${srcW}×${srcH} (${mp}MP)`);
 
-  // (F) ★ 非同步編碼：toBlob 走背景執行緒，不阻塞主線 ★
+  // v8：同時產出 (1) 原尺寸高畫質 blob 給本地存檔 (2) 縮小版 blob 給上傳
   Promise.all([
     canvasToBlob(cleanCanvas, "image/jpeg", JPEG_QUALITY),
-    canvasToBlob(stampedCanvas, "image/jpeg", JPEG_QUALITY)
-  ]).then(([cleanBlob, stampedBlob]) => {
+    canvasToBlob(stampedCanvas, "image/jpeg", JPEG_QUALITY),
+    canvasToUploadBlob(cleanCanvas),
+    canvasToUploadBlob(stampedCanvas)
+  ]).then(([cleanBlob, stampedBlob, cleanUploadBlob, stampedUploadBlob]) => {
     const task = Object.assign({}, snapshot, {
       width: srcW,
       height: srcH,
       cleanBlob,
       stampedBlob,
+      cleanUploadBlob,
+      stampedUploadBlob,
       cleanUrl: URL.createObjectURL(cleanBlob),
       stampedUrl: URL.createObjectURL(stampedBlob)
     });
 
     updateLatestThumbnail(task);
 
-    if (state.autoDownload) saveTaskToLocal(task, false);
+    // v8：iOS 強制忽略自動下載
+    if (state.autoDownload && !isIOS) saveTaskToLocal(task, false);
     if (state.autoUpload && state.gasUrl) {
       state.uploadQueue.push(task);
       triggerBackgroundUploader();
@@ -445,13 +461,29 @@ function canvasToBlob(canvas, type, quality) {
         else reject(new Error("toBlob 回傳 null"));
       }, type, quality);
     } else {
-      // 極少數不支援 toBlob 的環境退回 toDataURL
       try {
         const dataUrl = canvas.toDataURL(type, quality);
         fetch(dataUrl).then(r => r.blob()).then(resolve).catch(reject);
       } catch (e) { reject(e); }
     }
   });
+}
+
+// v8：縮小後再編碼 blob 給上傳用，加速 GAS 傳輸
+function canvasToUploadBlob(sourceCanvas) {
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  if (w <= UPLOAD_MAX_DIM && h <= UPLOAD_MAX_DIM) {
+    return canvasToBlob(sourceCanvas, "image/jpeg", UPLOAD_JPEG_QUALITY);
+  }
+  const ratio = Math.min(UPLOAD_MAX_DIM / w, UPLOAD_MAX_DIM / h);
+  const dw = Math.round(w * ratio);
+  const dh = Math.round(h * ratio);
+  const small = document.createElement("canvas");
+  small.width = dw;
+  small.height = dh;
+  small.getContext("2d").drawImage(sourceCanvas, 0, 0, dw, dh);
+  return canvasToBlob(small, "image/jpeg", UPLOAD_JPEG_QUALITY);
 }
 
 function blobToBase64(blob) {
@@ -467,7 +499,20 @@ function blobToBase64(blob) {
   });
 }
 
-// 5. 背景佇列上傳（blob → base64 只在上傳當下才轉）
+// v8：fetch 加上 timeout 避免 GAS 冷啟動卡死
+function fetchWithTimeout(url, options, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("上傳逾時"));
+    }, timeoutMs);
+    fetch(url, Object.assign({}, options, { signal: controller.signal }))
+      .then((res) => { clearTimeout(timer); resolve(res); })
+      .catch((err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
 async function triggerBackgroundUploader() {
   updateSyncBadge();
   if (state.isUploading) return;
@@ -477,9 +522,12 @@ async function triggerBackgroundUploader() {
     const task = state.uploadQueue[0];
     updateSyncBadge();
     try {
+      // v8：優先用縮小版 blob 加速上傳
+      const uploadClean = task.cleanUploadBlob || task.cleanBlob;
+      const uploadStamped = task.stampedUploadBlob || task.stampedBlob;
       const [cleanB64, stampedB64] = await Promise.all([
-        blobToBase64(task.cleanBlob),
-        blobToBase64(task.stampedBlob)
+        blobToBase64(uploadClean),
+        blobToBase64(uploadStamped)
       ]);
       const payload = {
         tripTitle: task.tripTitle,
@@ -490,11 +538,11 @@ async function triggerBackgroundUploader() {
         cleanImageBase64: cleanB64,
         stampedImageBase64: stampedB64
       };
-      const res = await fetch(state.gasUrl, {
+      const res = await fetchWithTimeout(state.gasUrl, {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify(payload)
-      });
+      }, 45000);
       const result = await res.json();
       if (result && result.status === "success") {
         state.uploadQueue.shift();
@@ -526,7 +574,6 @@ function updateSyncBadge() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// 6. 縮圖與預覽（改走 ObjectURL）
 function updateLatestThumbnail(task) {
   state.currentViewingPhoto = task;
   dom.latestThumbImg.src = task.stampedUrl;
@@ -567,12 +614,52 @@ function saveCurrentViewingToLocal() {
   saveTaskToLocal(state.currentViewingPhoto, true);
 }
 
-function saveTaskToLocal(task, showAlert) {
+// v8：iOS 走 Web Share API（一次呼叫兩個 File），Android/桌機走原本的下載連結
+async function saveTaskToLocal(task, showAlert) {
   const timeStr = task.timestamp.replace(/[: /]/g, "_");
-  downloadBlob(task.stampedBlob, `打卡印章_${timeStr}.jpg`);
-  setTimeout(() => downloadBlob(task.cleanBlob, `純淨原圖_${timeStr}.jpg`), 300);
+  const stampedName = `打卡印章_${timeStr}.jpg`;
+  const cleanName = `純淨原圖_${timeStr}.jpg`;
+
+  if (isIOS && canShareFiles) {
+    try {
+      const stampedFile = new File([task.stampedBlob], stampedName, { type: "image/jpeg" });
+      const cleanFile = new File([task.cleanBlob], cleanName, { type: "image/jpeg" });
+      const filesToShare = [stampedFile, cleanFile];
+
+      if (navigator.canShare({ files: filesToShare })) {
+        await navigator.share({
+          files: filesToShare,
+          title: task.tripTitle,
+          text: `${task.address} ${task.timestamp}`
+        });
+        if (showAlert) showQuickToast("✓ 分享表已開啟，請點「儲存影像」");
+        return;
+      }
+
+      // 分享表不支援多檔時，只分享打卡圖（多數情境夠用）
+      if (navigator.canShare({ files: [stampedFile] })) {
+        await navigator.share({ files: [stampedFile], title: task.tripTitle });
+        if (showAlert) showQuickToast("✓ 已分享打卡印章圖，純淨原圖請從雲端下載");
+        return;
+      }
+    } catch (err) {
+      // 使用者按取消或 share 失敗 → 不要再回退到下載連結，避免中斷鏡頭
+      if (err && err.name === "AbortError") {
+        showQuickToast("已取消存檔");
+        return;
+      }
+      console.warn("Web Share 失敗，回退到下載連結：", err);
+    }
+    // iOS 真的沒救時，提示使用者從預覽視窗長按儲存
+    alert("這台 iPhone 不支援直接存到相簿。請在預覽視窗長按圖片 → 選「儲存影像」。");
+    return;
+  }
+
+  // Android / 桌機：原本的下載路徑
+  downloadBlob(task.stampedBlob, stampedName);
+  setTimeout(() => downloadBlob(task.cleanBlob, cleanName), 300);
   if (showAlert) {
-    alert("已成功將【打卡印章圖】與【純淨原圖】存入手機相簿！");
+    alert("已將【打卡印章圖】與【純淨原圖】送入下載。");
   }
 }
 
@@ -584,11 +671,9 @@ function downloadBlob(blob, name) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  // 2 秒後釋放 URL
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-// 7. 繪圖與輔助
 function triggerShutterFlash() {
   dom.shutterFlash.classList.add("flash");
   setTimeout(() => dom.shutterFlash.classList.remove("flash"), 90);
@@ -657,7 +742,6 @@ function drawRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-// 8. 事件綁定
 let pinchStartDist = 0;
 let pinchStartZoom = 1;
 
@@ -721,7 +805,7 @@ function pinchDistance(touches) {
 function saveSettings() {
   state.gasUrl = dom.gasUrlInput.value.trim();
   state.autoUpload = dom.autoUploadCheck.checked;
-  state.autoDownload = dom.autoDownloadCheck.checked;
+  state.autoDownload = isIOS ? false : dom.autoDownloadCheck.checked;
   localStorage.setItem("travel_camera_gas_url", state.gasUrl);
   localStorage.setItem("travel_camera_auto_upload", state.autoUpload);
   localStorage.setItem("travel_camera_auto_download", state.autoDownload);
