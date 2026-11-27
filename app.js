@@ -1,9 +1,17 @@
 /**
- * 旅遊足跡相機核心控制腳本 (v5 背景無感秒拍與非阻塞上傳佇列版)
- * 解決重點：
- * 1. 拍照零延遲：快門一按立即完成，0.1秒秒拍，觀景窗完全不中斷，隨心所欲連拍！
- * 2. 背景佇列上傳：照片拍完自動排隊，在背景默默傳送到 Google 雲端硬碟，頂部微型徽章即時顯示進度。
- * 3. 左下角相片縮圖：最新拍攝照片即時預覽，點擊隨時檢視與存入手機相簿。
+ * 旅遊足跡相機核心控制腳本 (v6 最大畫素與縮放控制版)
+ *
+ * v6 新增重點（相較 v5）：
+ * 1. 自動探測裝置鏡頭的「最大支援解析度」：先用一般請求開啟鏡頭，再透過
+ *    track.getCapabilities() 讀出 width/height 上限，然後重新 applyConstraints
+ *    把解析度拉到裝置極限（例如 4000×3000、4032×3024 等），讓照片畫質大幅提升。
+ * 2. 縮放控制（Zoom）：
+ *    - 若裝置支援原生 zoom（多數 Android Chrome、部分 iOS Safari 16+），直接
+ *      透過 MediaStreamTrack applyConstraints 控制光學／原生數位變焦。
+ *    - 不支援的裝置退回「Canvas 裁切數位縮放」，預覽用 CSS transform，拍攝時
+ *      用 Canvas 中心裁切保留原始畫素，避免放大失真。
+ * 3. 拍照不再強制縮小到 1920px，而是用「原生解析度」存檔，JPEG 品質提升到 0.95。
+ * 4. 介面新增縮放滑桿與目前倍率顯示，雙指捏合手勢也會同步調整。
  */
 
 // 1. 全域狀態管理
@@ -15,11 +23,27 @@ const state = {
   currentTimestamp: "",
   activeTab: "stamped",
   mediaStream: null,
-  currentFacingMode: "environment", // 預設使用後置鏡頭
+  currentTrack: null,
+  currentFacingMode: "environment",
   gasUrl: localStorage.getItem("travel_camera_gas_url") || "https://script.google.com/macros/s/AKfycbxr3Zv5jRHXevBRVQdpJ1zINvYndnYtrsW6gfOg2-gGaf9pEXYWCLNkQECkirh-2X_OIw/exec",
   autoUpload: localStorage.getItem("travel_camera_auto_upload") !== "false",
   autoDownload: localStorage.getItem("travel_camera_auto_download") === "true",
-  
+
+  // 相機能力資訊（由 getCapabilities 取得）
+  cameraCaps: {
+    maxWidth: 0,
+    maxHeight: 0,
+    actualWidth: 0,
+    actualHeight: 0,
+    supportsNativeZoom: false,
+    zoomMin: 1,
+    zoomMax: 1,
+    zoomStep: 0.1
+  },
+
+  // 當前縮放倍率（原生 zoom 或數位倍率皆沿用此值）
+  currentZoom: 1,
+
   // 背景上傳佇列系統
   uploadQueue: [],
   isUploading: false,
@@ -28,8 +52,9 @@ const state = {
   currentViewingPhoto: null
 };
 
-// 記憶體保護安全上限 (1920px)
-const MAX_IMAGE_DIMENSION = 1920;
+// v6 不再硬性限制最大邊長；用 null 代表「原生解析度存檔」
+const MAX_IMAGE_DIMENSION = null;
+const JPEG_QUALITY = 0.95;
 
 // 2. DOM 元素快取
 const dom = {
@@ -56,7 +81,7 @@ const dom = {
   gasUrlInput: document.getElementById("gasUrlInput"),
   autoUploadCheck: document.getElementById("autoUploadCheck"),
   autoDownloadCheck: document.getElementById("autoDownloadCheck"),
-  
+
   // 縮圖與預覽彈窗
   thumbnailContainer: document.getElementById("thumbnailContainer"),
   latestThumbImg: document.getElementById("latestThumbImg"),
@@ -67,7 +92,15 @@ const dom = {
   tabClean: document.getElementById("tabClean"),
   btnClosePreview: document.getElementById("btnClosePreview"),
   btnSaveLocal: document.getElementById("btnSaveLocal"),
-  btnForceUpload: document.getElementById("btnForceUpload")
+  btnForceUpload: document.getElementById("btnForceUpload"),
+
+  // v6 新增：解析度與縮放 UI
+  resolutionBadge: document.getElementById("resolutionBadge"),
+  zoomPanel: document.getElementById("zoomPanel"),
+  zoomSlider: document.getElementById("zoomSlider"),
+  zoomValue: document.getElementById("zoomValue"),
+  btnZoomOut: document.getElementById("btnZoomOut"),
+  btnZoomIn: document.getElementById("btnZoomIn")
 };
 
 // 3. 網頁啟動初始化
@@ -75,58 +108,183 @@ window.addEventListener("DOMContentLoaded", () => {
   initSettings();
   initGeolocation();
   initEventHandlers();
-  
-  // 自動啟動鏡頭
   startCamera();
 });
 
-// 4. 設定初始化
 function initSettings() {
   dom.gasUrlInput.value = state.gasUrl;
   dom.autoUploadCheck.checked = state.autoUpload;
   dom.autoDownloadCheck.checked = state.autoDownload;
 }
 
-// 5. 相機啟動與三階段相容請求
+// 4. 相機啟動（兩段式：先開啟 → 再拉到最大解析度）
 async function startCamera() {
   stopCamera();
   let stream = null;
 
+  // 第一階段：先用相對寬鬆的條件開啟鏡頭，確保能拿到串流
+  const facing = state.currentFacingMode;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: state.currentFacingMode } },
+      video: {
+        facingMode: { ideal: facing },
+        width: { ideal: 4096 },
+        height: { ideal: 4096 }
+      },
       audio: false
     });
-  } catch (err1) {
+  } catch (e1) {
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: state.currentFacingMode },
+        video: { facingMode: facing },
         audio: false
       });
-    } catch (err2) {
+    } catch (e2) {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      } catch (err3) {
-        console.error("相機存取被拒或不支援:", err3);
+      } catch (e3) {
+        console.error("相機存取失敗：", e3);
+        dom.cameraPromptOverlay.style.display = "flex";
+        return;
       }
     }
   }
 
-  if (stream) {
-    state.mediaStream = stream;
-    const video = dom.cameraVideo;
-    video.srcObject = stream;
+  state.mediaStream = stream;
+  state.currentTrack = stream.getVideoTracks()[0];
 
-    video.onloadedmetadata = async () => {
-      try {
-        await video.play();
-        dom.cameraPromptOverlay.style.display = "none";
-      } catch (e) {
-        dom.cameraPromptOverlay.style.display = "flex";
-      }
-    };
+  // 第二階段：讀出裝置最大畫素，再 applyConstraints 推到極限
+  await applyMaxResolution(state.currentTrack);
+
+  // 第三階段：探測縮放能力並刷新 UI
+  detectZoomCapability(state.currentTrack);
+  refreshResolutionBadge();
+
+  const video = dom.cameraVideo;
+  video.srcObject = stream;
+  video.onloadedmetadata = async () => {
+    try {
+      await video.play();
+      dom.cameraPromptOverlay.style.display = "none";
+      refreshResolutionBadge();
+    } catch (e) {
+      dom.cameraPromptOverlay.style.display = "flex";
+    }
+  };
+}
+
+async function applyMaxResolution(track) {
+  if (!track || typeof track.getCapabilities !== "function") return;
+  try {
+    const caps = track.getCapabilities();
+    const maxW = caps.width && caps.width.max ? caps.width.max : 0;
+    const maxH = caps.height && caps.height.max ? caps.height.max : 0;
+    state.cameraCaps.maxWidth = maxW;
+    state.cameraCaps.maxHeight = maxH;
+
+    if (maxW && maxH) {
+      await track.applyConstraints({
+        advanced: [{ width: maxW, height: maxH }]
+      });
+    }
+  } catch (err) {
+    console.warn("調整至最大解析度失敗，使用預設值：", err);
+  }
+
+  const settings = track.getSettings ? track.getSettings() : {};
+  state.cameraCaps.actualWidth = settings.width || 0;
+  state.cameraCaps.actualHeight = settings.height || 0;
+}
+
+function detectZoomCapability(track) {
+  state.cameraCaps.supportsNativeZoom = false;
+  state.cameraCaps.zoomMin = 1;
+  state.cameraCaps.zoomMax = 1;
+  state.cameraCaps.zoomStep = 0.1;
+  state.currentZoom = 1;
+
+  if (!track || typeof track.getCapabilities !== "function") {
+    setupDigitalZoomUI();
+    return;
+  }
+  const caps = track.getCapabilities();
+  if (caps.zoom && typeof caps.zoom.max === "number" && caps.zoom.max > caps.zoom.min) {
+    state.cameraCaps.supportsNativeZoom = true;
+    state.cameraCaps.zoomMin = caps.zoom.min;
+    state.cameraCaps.zoomMax = caps.zoom.max;
+    state.cameraCaps.zoomStep = caps.zoom.step || 0.1;
+    state.currentZoom = caps.zoom.min;
+    setupNativeZoomUI();
   } else {
-    dom.cameraPromptOverlay.style.display = "flex";
+    // 不支援原生 zoom，退回數位裁切變焦（1x–4x）
+    state.cameraCaps.zoomMin = 1;
+    state.cameraCaps.zoomMax = 4;
+    state.cameraCaps.zoomStep = 0.1;
+    state.currentZoom = 1;
+    setupDigitalZoomUI();
+  }
+}
+
+function setupNativeZoomUI() {
+  const { zoomMin, zoomMax, zoomStep } = state.cameraCaps;
+  dom.zoomPanel.style.display = "flex";
+  dom.zoomSlider.min = String(zoomMin);
+  dom.zoomSlider.max = String(zoomMax);
+  dom.zoomSlider.step = String(zoomStep);
+  dom.zoomSlider.value = String(state.currentZoom);
+  updateZoomLabel();
+  dom.cameraVideo.style.transform = "";
+  dom.cameraVideo.style.transformOrigin = "center center";
+}
+
+function setupDigitalZoomUI() {
+  dom.zoomPanel.style.display = "flex";
+  dom.zoomSlider.min = "1";
+  dom.zoomSlider.max = "4";
+  dom.zoomSlider.step = "0.1";
+  dom.zoomSlider.value = "1";
+  state.currentZoom = 1;
+  updateZoomLabel();
+  applyDigitalZoomPreview();
+}
+
+function updateZoomLabel() {
+  dom.zoomValue.textContent = `${state.currentZoom.toFixed(1)}x`;
+}
+
+async function setZoom(value) {
+  const z = Math.max(state.cameraCaps.zoomMin, Math.min(state.cameraCaps.zoomMax, Number(value)));
+  state.currentZoom = z;
+  updateZoomLabel();
+  dom.zoomSlider.value = String(z);
+
+  if (state.cameraCaps.supportsNativeZoom && state.currentTrack) {
+    try {
+      await state.currentTrack.applyConstraints({ advanced: [{ zoom: z }] });
+    } catch (e) {
+      console.warn("原生 zoom 調整失敗：", e);
+    }
+  } else {
+    applyDigitalZoomPreview();
+  }
+}
+
+function applyDigitalZoomPreview() {
+  // 數位縮放只放大預覽；拍照時用 Canvas 裁切保留原始畫素
+  const z = state.currentZoom;
+  dom.cameraVideo.style.transformOrigin = "center center";
+  dom.cameraVideo.style.transform = `scale(${z})`;
+}
+
+function refreshResolutionBadge() {
+  const w = state.cameraCaps.actualWidth || dom.cameraVideo.videoWidth || 0;
+  const h = state.cameraCaps.actualHeight || dom.cameraVideo.videoHeight || 0;
+  if (w && h) {
+    const mp = ((w * h) / 1000000).toFixed(1);
+    dom.resolutionBadge.textContent = `${w}×${h} (${mp}MP)`;
+    dom.resolutionBadge.style.display = "inline-block";
+  } else {
+    dom.resolutionBadge.style.display = "none";
   }
 }
 
@@ -135,7 +293,9 @@ function stopCamera() {
     state.mediaStream.getTracks().forEach(t => t.stop());
     state.mediaStream = null;
   }
+  state.currentTrack = null;
   dom.cameraVideo.srcObject = null;
+  dom.cameraVideo.style.transform = "";
 }
 
 function switchCamera() {
@@ -143,21 +303,18 @@ function switchCamera() {
   startCamera();
 }
 
-// 6. 定位與地址解析
+// 5. 定位與地址解析（沿用 v5）
 function initGeolocation() {
   if (!navigator.geolocation) {
     updateGpsUI(false, "手機不支援定位功能");
     return;
   }
-
   updateGpsUI(null, "正在抓取衛星定位中...");
-
   navigator.geolocation.watchPosition(
     async (pos) => {
       state.latitude = pos.coords.latitude;
       state.longitude = pos.coords.longitude;
       state.accuracy = pos.coords.accuracy;
-
       updateGpsUI(true, `定位成功 (誤差約 ${Math.round(pos.coords.accuracy)} 公尺)`);
       await resolveChineseAddress(pos.coords.latitude, pos.coords.longitude);
     },
@@ -207,7 +364,7 @@ function formatAddress(data) {
   return full.trim() || data.display_name;
 }
 
-// 7. 零延遲秒拍核心（拍照完成立刻回到觀景窗，上傳交由背景佇列）
+// 6. 零延遲秒拍 + 原生解析度存檔
 function capturePhotoInstantly() {
   const video = dom.cameraVideo;
   if (!video.videoWidth || !video.videoHeight) {
@@ -215,46 +372,56 @@ function capturePhotoInstantly() {
     return;
   }
 
-  // 1. 觸發震動與快門閃爍動畫
   if (navigator.vibrate) navigator.vibrate(40);
   triggerShutterFlash();
 
-  // 2. 抓取當下的時間與座標快照
   const timestampStr = formatFullDate(new Date());
   const currentAddress = state.address;
   const currentLat = state.latitude;
   const currentLon = state.longitude;
   const currentTripTitle = dom.tripTitleInput.value.trim() || "旅遊隨手拍";
 
-  // 3. 尺寸約束與雙圖生成 (記憶體保護)
   const origW = video.videoWidth;
   const origH = video.videoHeight;
-  const { targetW, targetH } = getConstrainedDimensions(origW, origH, MAX_IMAGE_DIMENSION);
 
-  // 產出版本 B：純淨原圖
+  // 計算來源裁切（只在數位縮放時啟用，光學縮放時交給硬體處理）
+  const useDigitalZoom = !state.cameraCaps.supportsNativeZoom && state.currentZoom > 1.01;
+  let srcX = 0, srcY = 0, srcW = origW, srcH = origH;
+  if (useDigitalZoom) {
+    const z = state.currentZoom;
+    srcW = Math.round(origW / z);
+    srcH = Math.round(origH / z);
+    srcX = Math.round((origW - srcW) / 2);
+    srcY = Math.round((origH - srcH) / 2);
+  }
+
+  // v6：輸出目標尺寸 = 來源尺寸（原生畫素，不再縮水）
+  const targetW = srcW;
+  const targetH = srcH;
+
+  // 版本 B：純淨原圖
   const cleanCanvas = dom.cleanCanvas;
   cleanCanvas.width = targetW;
   cleanCanvas.height = targetH;
   const cleanCtx = cleanCanvas.getContext("2d");
-  cleanCtx.drawImage(video, 0, 0, targetW, targetH);
-  const cleanDataUrl = cleanCanvas.toDataURL("image/jpeg", 0.85);
+  cleanCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, targetW, targetH);
+  const cleanDataUrl = cleanCanvas.toDataURL("image/jpeg", JPEG_QUALITY);
 
-  // 產出版本 A：打卡印章圖
+  // 版本 A：打卡印章圖
   const stampedCanvas = dom.stampedCanvas;
   stampedCanvas.width = targetW;
   stampedCanvas.height = targetH;
   const stampedCtx = stampedCanvas.getContext("2d");
-  stampedCtx.drawImage(video, 0, 0, targetW, targetH);
+  stampedCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, targetW, targetH);
   drawTravelStamp(stampedCtx, targetW, targetH, currentTripTitle, currentAddress, timestampStr, currentLat, currentLon);
-  const stampedDataUrl = stampedCanvas.toDataURL("image/jpeg", 0.85);
+  const stampedDataUrl = stampedCanvas.toDataURL("image/jpeg", JPEG_QUALITY);
 
-  // 立即重置畫布釋放暫存記憶體
+  // 立刻釋放畫布記憶體
   cleanCanvas.width = 1;
   cleanCanvas.height = 1;
   stampedCanvas.width = 1;
   stampedCanvas.height = 1;
 
-  // 4. 打包照片任務物件
   const photoTask = {
     id: Date.now(),
     tripTitle: currentTripTitle,
@@ -262,40 +429,34 @@ function capturePhotoInstantly() {
     address: currentAddress,
     latitude: currentLat,
     longitude: currentLon,
+    width: targetW,
+    height: targetH,
     cleanImageDataUrl: cleanDataUrl,
     stampedImageDataUrl: stampedDataUrl
   };
 
-  // 5. 更新左下角縮圖並儲存最新快照
   updateLatestThumbnail(photoTask);
+  const mp = ((targetW * targetH) / 1000000).toFixed(1);
+  showQuickToast(`✓ 已拍下 ${targetW}×${targetH} (${mp}MP)`);
 
-  // 6. 浮動微通知：已拍下
-  showQuickToast("✓ 已拍下！背景同步中");
-
-  // 7. 若開啟自動下載手機相簿
   if (state.autoDownload) {
     saveTaskToLocal(photoTask, false);
   }
-
-  // 8. 推入背景上傳佇列（完全不阻擋前台拍照，你可以立刻按下一張！）
   if (state.autoUpload && state.gasUrl) {
     state.uploadQueue.push(photoTask);
     triggerBackgroundUploader();
   }
 }
 
-// 8. 背景佇列上傳引擎 (Background Upload Queue)
+// 7. 背景佇列上傳（沿用 v5）
 async function triggerBackgroundUploader() {
   updateSyncBadge();
-
-  // 若已有上傳工序正在進行中，讓其自然依序消費佇列
   if (state.isUploading) return;
   state.isUploading = true;
 
   while (state.uploadQueue.length > 0) {
     const currentTask = state.uploadQueue[0];
     updateSyncBadge();
-
     try {
       const payload = {
         tripTitle: currentTask.tripTitle,
@@ -306,27 +467,22 @@ async function triggerBackgroundUploader() {
         cleanImageBase64: currentTask.cleanImageDataUrl.split(",")[1],
         stampedImageBase64: currentTask.stampedImageDataUrl.split(",")[1]
       };
-
       const res = await fetch(state.gasUrl, {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify(payload)
       });
-
       const result = await res.json();
       if (result && result.status === "success") {
-        // 成功上傳，從佇列移出
         state.uploadQueue.shift();
       } else {
         throw new Error("伺服器未回傳成功");
       }
     } catch (err) {
       console.warn("背景上傳暫時延遲，3秒後自動重試...", err);
-      // 遇網路問題稍作等待，再重試，不丟出錯誤中斷使用者
       await sleep(3000);
     }
   }
-
   state.isUploading = false;
   updateSyncBadge();
 }
@@ -335,9 +491,7 @@ function updateSyncBadge() {
   const count = state.uploadQueue.length;
   const badge = dom.cloudSyncBadge;
   const text = dom.syncText;
-
   badge.className = "sync-badge";
-
   if (count > 0) {
     badge.classList.add("syncing");
     text.textContent = `同步中 (${count}張)...`;
@@ -347,11 +501,9 @@ function updateSyncBadge() {
   }
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// 9. 左下角縮圖與預覽控制
+// 8. 縮圖與預覽
 function updateLatestThumbnail(photoTask) {
   state.currentViewingPhoto = photoTask;
   dom.latestThumbImg.src = photoTask.stampedImageDataUrl;
@@ -376,7 +528,6 @@ function closePreviewModal() {
 function updatePreviewModalContent() {
   const photo = state.currentViewingPhoto;
   if (!photo) return;
-
   if (state.activeTab === "stamped") {
     dom.tabStamped.classList.add("active");
     dom.tabClean.classList.remove("active");
@@ -388,7 +539,6 @@ function updatePreviewModalContent() {
   }
 }
 
-// 10. 本地存檔
 function saveCurrentViewingToLocal() {
   if (!state.currentViewingPhoto) return;
   saveTaskToLocal(state.currentViewingPhoto, true);
@@ -412,18 +562,7 @@ function downloadDataUrl(url, name) {
   document.body.removeChild(a);
 }
 
-// 11. 輔助繪圖與計算工具
-function getConstrainedDimensions(width, height, maxDimension) {
-  if (width <= maxDimension && height <= maxDimension) {
-    return { targetW: width, targetH: height };
-  }
-  const ratio = Math.min(maxDimension / width, maxDimension / height);
-  return {
-    targetW: Math.round(width * ratio),
-    targetH: Math.round(height * ratio)
-  };
-}
-
+// 9. 繪圖工具
 function triggerShutterFlash() {
   dom.shutterFlash.classList.add("flash");
   setTimeout(() => dom.shutterFlash.classList.remove("flash"), 90);
@@ -432,7 +571,7 @@ function triggerShutterFlash() {
 function showQuickToast(msg) {
   dom.quickToast.textContent = msg;
   dom.quickToast.classList.add("show");
-  setTimeout(() => dom.quickToast.classList.remove("show"), 1200);
+  setTimeout(() => dom.quickToast.classList.remove("show"), 1500);
 }
 
 function drawTravelStamp(ctx, width, height, title, addr, timeText, lat, lon) {
@@ -441,7 +580,6 @@ function drawTravelStamp(ctx, width, height, title, addr, timeText, lat, lon) {
   const titleFontSize = Math.round(23 * scale);
   const padding = Math.round(18 * scale);
   const cardMargin = Math.round(20 * scale);
-
   const coordsText = (lat && lon)
     ? `座標：${lat.toFixed(6)}° N, ${lon.toFixed(6)}° E`
     : "衛星座標抓取中";
@@ -458,25 +596,20 @@ function drawTravelStamp(ctx, width, height, title, addr, timeText, lat, lon) {
   ctx.shadowBlur = 10 * scale;
   drawRoundRect(ctx, cardX, cardY, cardWidth, cardHeight, 10 * scale);
   ctx.fill();
-
   ctx.shadowBlur = 0;
 
-  // 標題
   ctx.fillStyle = "#2ed573";
   ctx.font = `bold ${titleFontSize}px "Microsoft JhengHei", sans-serif`;
   ctx.fillText(`🚩 ${title}`, cardX + padding, cardY + padding + (titleFontSize * 0.8));
 
-  // 地址
   ctx.fillStyle = "#ffffff";
   ctx.font = `500 ${baseFontSize}px "Microsoft JhengHei", sans-serif`;
   ctx.fillText(`📍 ${addr}`, cardX + padding, cardY + padding + titleFontSize + lineHeight);
 
-  // 時間
   ctx.fillStyle = "#eccc68";
   ctx.font = `${Math.round(baseFontSize * 0.9)}px "Microsoft JhengHei", sans-serif`;
   ctx.fillText(`🕒 ${timeText}`, cardX + padding, cardY + padding + titleFontSize + (lineHeight * 2));
 
-  // 經緯度
   ctx.fillStyle = "#ced6e0";
   ctx.font = `${Math.round(baseFontSize * 0.85)}px monospace`;
   ctx.fillText(`🌐 ${coordsText}`, cardX + padding, cardY + padding + titleFontSize + (lineHeight * 2.9));
@@ -498,25 +631,18 @@ function drawRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-// 12. 事件綁定
+// 10. 事件綁定
+let pinchStartDist = 0;
+let pinchStartZoom = 1;
+
 function initEventHandlers() {
-  // 快門秒拍按鈕
   dom.btnCapture.addEventListener("click", capturePhotoInstantly);
-
-  // 切換前後鏡頭
   dom.btnSwitchCamera.addEventListener("click", switchCamera);
-
-  // 啟動相機手勢按鈕
   dom.btnStartCameraManual.addEventListener("click", startCamera);
-
-  // 重整定位按鈕
   dom.btnRefreshGps.addEventListener("click", initGeolocation);
 
-  // 點擊左下角縮圖開啟照片檢視
   dom.thumbnailContainer.addEventListener("click", openPreviewModal);
   dom.btnClosePreview.addEventListener("click", closePreviewModal);
-
-  // 預覽分頁切換
   dom.tabStamped.addEventListener("click", () => {
     state.activeTab = "stamped";
     updatePreviewModalContent();
@@ -525,11 +651,7 @@ function initEventHandlers() {
     state.activeTab = "clean";
     updatePreviewModalContent();
   });
-
-  // 存入手機按鈕
   dom.btnSaveLocal.addEventListener("click", saveCurrentViewingToLocal);
-
-  // 手動立即同步
   dom.btnForceUpload.addEventListener("click", () => {
     if (state.currentViewingPhoto) {
       state.uploadQueue.push(state.currentViewingPhoto);
@@ -539,21 +661,46 @@ function initEventHandlers() {
     }
   });
 
-  // 設定彈窗
   dom.btnSettings.addEventListener("click", () => dom.settingsModal.style.display = "flex");
   dom.btnCloseSettings.addEventListener("click", () => dom.settingsModal.style.display = "none");
   dom.btnSaveSettings.addEventListener("click", saveSettings);
+
+  // v6 縮放控制
+  dom.zoomSlider.addEventListener("input", (e) => setZoom(e.target.value));
+  dom.btnZoomIn.addEventListener("click", () => setZoom(state.currentZoom + state.cameraCaps.zoomStep));
+  dom.btnZoomOut.addEventListener("click", () => setZoom(state.currentZoom - state.cameraCaps.zoomStep));
+
+  // 雙指捏合縮放
+  const vp = document.getElementById("viewportArea");
+  vp.addEventListener("touchstart", (e) => {
+    if (e.touches.length === 2) {
+      pinchStartDist = pinchDistance(e.touches);
+      pinchStartZoom = state.currentZoom;
+    }
+  }, { passive: true });
+  vp.addEventListener("touchmove", (e) => {
+    if (e.touches.length === 2 && pinchStartDist > 0) {
+      const d = pinchDistance(e.touches);
+      const ratio = d / pinchStartDist;
+      setZoom(pinchStartZoom * ratio);
+    }
+  }, { passive: true });
+  vp.addEventListener("touchend", () => { pinchStartDist = 0; });
+}
+
+function pinchDistance(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.sqrt(dx * dx + dy * dy);
 }
 
 function saveSettings() {
   state.gasUrl = dom.gasUrlInput.value.trim();
   state.autoUpload = dom.autoUploadCheck.checked;
   state.autoDownload = dom.autoDownloadCheck.checked;
-
   localStorage.setItem("travel_camera_gas_url", state.gasUrl);
   localStorage.setItem("travel_camera_auto_upload", state.autoUpload);
   localStorage.setItem("travel_camera_auto_download", state.autoDownload);
-
   dom.settingsModal.style.display = "none";
   alert("雲端同步設定已儲存！");
 }

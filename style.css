@@ -591,3 +591,81 @@ html, body {
   display: flex;
   justify-content: flex-end;
 }
+
+/* ========== v6 新增：縮放面板與解析度徽章 ========== */
+.resolution-badge {
+  margin-left: auto;
+  padding: 2px 8px;
+  background: rgba(46, 213, 115, 0.18);
+  border: 1px solid #2ed573;
+  color: #7bed9f;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.zoom-panel {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 6px;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 24px;
+  z-index: 15;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.zoom-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 20px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.zoom-btn:active { background: rgba(255, 255, 255, 0.25); }
+
+.zoom-slider {
+  -webkit-appearance: slider-vertical;
+  writing-mode: bt-lr;
+  width: 30px;
+  height: 160px;
+  background: transparent;
+}
+
+.zoom-value {
+  color: #eccc68;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 8px;
+  min-width: 36px;
+  text-align: center;
+}
+
+/* 預覽圖：避免大畫素圖片塞爆版面 */
+.preview-img {
+  max-width: 100%;
+  max-height: 70vh;
+  object-fit: contain;
+}
+
+/* 縮放時保留平滑邊緣 */
+.camera-stream {
+  transition: transform 0.12s ease-out;
+  will-change: transform;
+}
