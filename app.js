@@ -41,7 +41,11 @@ const state = {
 
   uploadQueue: [],
   isUploading: false,
-  currentViewingPhoto: null
+  currentViewingPhoto: null,
+  // v10：待存相簿佇列（iOS 必須人工點 💾 才能一次 share 全部）
+  pendingLocalSaves: [],
+  // v10：第二勾選鈕的新語意 —「存入相簿時包含純淨原圖 B」
+  includeClean: localStorage.getItem("travel_camera_include_clean") !== "false"
 };
 
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
@@ -80,10 +84,12 @@ const dom = {
   gasUrlInput: document.getElementById("gasUrlInput"),
   autoUploadCheck: document.getElementById("autoUploadCheck"),
   autoDownloadCheck: document.getElementById("autoDownloadCheck"),
+  includeCleanCheck: document.getElementById("includeCleanCheck"),
 
   thumbnailContainer: document.getElementById("thumbnailContainer"),
   latestThumbImg: document.getElementById("latestThumbImg"),
   thumbPlaceholder: document.getElementById("thumbPlaceholder"),
+  pendingBadge: document.getElementById("pendingBadge"),
   previewModal: document.getElementById("previewModal"),
   previewImg: document.getElementById("previewImg"),
   tabStamped: document.getElementById("tabStamped"),
@@ -110,19 +116,22 @@ window.addEventListener("DOMContentLoaded", () => {
 function initSettings() {
   dom.gasUrlInput.value = state.gasUrl;
   dom.autoUploadCheck.checked = state.autoUpload;
-  dom.autoDownloadCheck.checked = state.autoDownload;
-
-  // v8：iOS 直接鎖住自動下載選項並說明原因
-  if (isIOS) {
-    dom.autoDownloadCheck.checked = false;
-    dom.autoDownloadCheck.disabled = true;
-    state.autoDownload = false;
-    const label = dom.autoDownloadCheck.closest(".switch-row");
-    if (label) {
-      const tip = document.createElement("div");
-      tip.style.cssText = "font-size:0.8rem;color:#eccc68;margin-top:4px;line-height:1.4;";
-      tip.textContent = "📱 iPhone 無法背景自動存相簿（會中斷鏡頭）。請拍完後點縮圖→💾，從系統分享表選「儲存影像」。";
-      label.appendChild(tip);
+  // v10：第 2 勾選鈕解鎖；在 iOS 改語意為「存相簿時包含純淨原圖 B」
+  if (dom.includeCleanCheck) {
+    dom.includeCleanCheck.checked = state.includeClean;
+  }
+  if (dom.autoDownloadCheck) {
+    dom.autoDownloadCheck.checked = state.autoDownload;
+    if (isIOS) {
+      // iOS 這個選項對自動存相簿無效（Web Share 必須人工點），但讓使用者可勾
+      const label = dom.autoDownloadCheck.closest(".switch-row");
+      if (label && !label.dataset.iosTip) {
+        label.dataset.iosTip = "1";
+        const tip = document.createElement("div");
+        tip.style.cssText = "font-size:0.78rem;color:#eccc68;margin-top:4px;line-height:1.4;";
+        tip.textContent = "📱 iPhone 上這個不會自動存（iOS 禁止背景自動存相簿）。請拍完後點左下縮圖→💾，一次把全部待存送進分享表。";
+        label.appendChild(tip);
+      }
     }
   }
 }
@@ -441,7 +450,11 @@ function capturePhotoInstantly() {
 
     updateLatestThumbnail(task);
 
-    // v8：iOS 強制忽略自動下載
+    // v10：每張新照片一律入待存佇列，由使用者點 💾 批次 share
+    state.pendingLocalSaves.push(task);
+    updatePendingBadge();
+
+    // Android/桌機：若使用者有勾「自動下載」才立即下載
     if (state.autoDownload && !isIOS) saveTaskToLocal(task, false);
     if (state.autoUpload && state.gasUrl) {
       state.uploadQueue.push(task);
@@ -592,19 +605,33 @@ function openPreviewModal() {
     try { dom.cameraVideo.pause(); } catch (e) {}
   }
   updatePreviewModalContent();
+  updateSaveButtonLabel();
   dom.previewModal.style.display = "flex";
 }
 
+// v10：鏡頭硬救 —— iOS 的 video.play() 常回傳 resolved 但沒真的動，用 readyState 兜底
 function closePreviewModal() {
   dom.previewModal.style.display = "none";
-  // v9：關閉預覽時清空 src 釋放大圖記憶體，再強制讓鏡頭恢復播放
-  try { dom.previewImg.removeAttribute("src"); } catch (e) {}
-  if (dom.cameraVideo && dom.cameraVideo.srcObject) {
-    dom.cameraVideo.play().catch((err) => {
-      console.warn("恢復鏡頭播放失敗，重啟串流：", err);
+  try {
+    dom.previewImg.removeAttribute("src");
+    dom.previewImg.src = "";
+  } catch (e) {}
+  // 延遲 80ms 讓 WKWebView 回收大圖記憶體再判定鏡頭狀態
+  setTimeout(() => {
+    const v = dom.cameraVideo;
+    if (!v) return;
+    const needRestart = !v.srcObject
+      || v.readyState < 2
+      || !state.mediaStream
+      || !state.mediaStream.active
+      || v.paused;
+    if (needRestart) {
+      console.warn("[v10] 鏡頭疑似卡住，重建串流");
       startCamera();
-    });
-  }
+      return;
+    }
+    v.play().catch(() => startCamera());
+  }, 80);
 }
 
 function updatePreviewModalContent() {
@@ -621,9 +648,88 @@ function updatePreviewModalContent() {
   }
 }
 
-function saveCurrentViewingToLocal() {
-  if (!state.currentViewingPhoto) return;
-  saveTaskToLocal(state.currentViewingPhoto, true);
+// v10：按 💾 時一次 share 所有待存照片（iOS 一按 = 全部進相簿）
+async function saveAllPendingToLocal() {
+  const pending = state.pendingLocalSaves.slice();
+  if (pending.length === 0) {
+    alert("沒有待存的新照片。所有已拍的照片都存過了。");
+    return;
+  }
+  const files = [];
+  for (const task of pending) {
+    const timeStr = task.timestamp.replace(/[: /]/g, "_");
+    files.push(new File([task.stampedBlob], `打卡印章_${timeStr}.jpg`, { type: "image/jpeg" }));
+    if (state.includeClean) {
+      files.push(new File([task.cleanBlob], `純淨原圖_${timeStr}.jpg`, { type: "image/jpeg" }));
+    }
+  }
+
+  if (isIOS && canShareFiles) {
+    try {
+      if (navigator.canShare({ files })) {
+        await navigator.share({
+          files,
+          title: pending[0].tripTitle,
+          text: `共 ${pending.length} 張 · ${state.includeClean ? "打卡圖+純淨原圖" : "打卡圖"}`
+        });
+        // 分享成功：清空待存佇列、更新角標
+        clearPendingSaves();
+        showQuickToast(`✓ 已傳 ${pending.length} 張到分享表，請按「儲存影像」`);
+        return;
+      }
+      // 太多檔案 iOS 不接 → 逐張分享（最多前 5 張，提示使用者分批）
+      const limited = files.slice(0, 6);
+      if (navigator.canShare({ files: limited })) {
+        await navigator.share({ files: limited, title: pending[0].tripTitle });
+        // 這條路徑只能保守清掉最前面 3 張（打卡+純淨算一張）
+        const savedCount = state.includeClean ? Math.floor(limited.length / 2) : limited.length;
+        state.pendingLocalSaves.splice(0, savedCount);
+        updatePendingBadge();
+        updateSaveButtonLabel();
+        showQuickToast(`✓ 已存前 ${savedCount} 張，剩下再按一次`);
+        return;
+      }
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        showQuickToast("已取消存檔（待存佇列保留）");
+        return;
+      }
+      console.warn("Web Share 失敗：", err);
+    }
+    alert("這台 iPhone 不支援直接存到相簿。請在預覽視窗長按圖片 → 選「儲存影像」。");
+    return;
+  }
+
+  // Android/桌機：批次下載
+  for (const f of files) {
+    downloadBlob(f, f.name);
+    await sleep(150);
+  }
+  clearPendingSaves();
+  alert(`已將 ${pending.length} 張（共 ${files.length} 個檔案）送入下載。`);
+}
+
+function clearPendingSaves() {
+  state.pendingLocalSaves = [];
+  updatePendingBadge();
+  updateSaveButtonLabel();
+}
+
+function updatePendingBadge() {
+  const n = state.pendingLocalSaves.length;
+  if (!dom.pendingBadge) return;
+  if (n > 0) {
+    dom.pendingBadge.textContent = n > 99 ? "99+" : String(n);
+    dom.pendingBadge.style.display = "flex";
+  } else {
+    dom.pendingBadge.style.display = "none";
+  }
+}
+
+function updateSaveButtonLabel() {
+  if (!dom.btnSaveLocal) return;
+  const n = state.pendingLocalSaves.length;
+  dom.btnSaveLocal.textContent = n > 0 ? `💾 存入相簿 (${n} 張未存)` : "💾 存入相簿";
 }
 
 // v8：iOS 走 Web Share API（一次呼叫兩個 File），Android/桌機走原本的下載連結
@@ -773,7 +879,7 @@ function initEventHandlers() {
     state.activeTab = "clean";
     updatePreviewModalContent();
   });
-  dom.btnSaveLocal.addEventListener("click", saveCurrentViewingToLocal);
+  dom.btnSaveLocal.addEventListener("click", saveAllPendingToLocal);
   dom.btnForceUpload.addEventListener("click", () => {
     if (state.currentViewingPhoto) {
       state.uploadQueue.push(state.currentViewingPhoto);
@@ -817,12 +923,15 @@ function pinchDistance(touches) {
 function saveSettings() {
   state.gasUrl = dom.gasUrlInput.value.trim();
   state.autoUpload = dom.autoUploadCheck.checked;
-  state.autoDownload = isIOS ? false : dom.autoDownloadCheck.checked;
+  // v10：iOS 讓使用者勾也不強推，保留偏好；Android/桌機才真的生效
+  state.autoDownload = dom.autoDownloadCheck ? dom.autoDownloadCheck.checked : false;
+  if (dom.includeCleanCheck) state.includeClean = dom.includeCleanCheck.checked;
   localStorage.setItem("travel_camera_gas_url", state.gasUrl);
   localStorage.setItem("travel_camera_auto_upload", state.autoUpload);
   localStorage.setItem("travel_camera_auto_download", state.autoDownload);
+  localStorage.setItem("travel_camera_include_clean", state.includeClean);
   dom.settingsModal.style.display = "none";
-  alert("雲端同步設定已儲存！");
+  alert("設定已儲存！");
 }
 
 function formatFullDate(date) {

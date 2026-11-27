@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>旅遊足跡隨手拍 - iOS 設定按鈕與鏡頭保護修復 (v9)</title>
-  <link rel="stylesheet" href="style.css?v=9">
+  <title>旅遊足跡隨手拍 - 連拍批次存相簿 + 鏡頭硬救 (v10)</title>
+  <link rel="stylesheet" href="style.css?v=10">
 </head>
 <body>
   <div class="app-container">
     <header class="top-bar">
       <div class="title-section">
         <span class="app-icon">📷</span>
-        <h1 class="app-title">旅遊相機 <span class="version-tag">v9</span></h1>
+        <h1 class="app-title">旅遊相機 <span class="version-tag">v10</span></h1>
       </div>
 
       <div id="cloudSyncBadge" class="sync-badge idle" title="雲端同步狀態">
@@ -88,9 +88,10 @@
     </main>
 
     <footer class="bottom-controls" id="cameraControls">
-      <div id="thumbnailContainer" class="thumbnail-wrapper" title="點擊檢視最新照片">
+      <div id="thumbnailContainer" class="thumbnail-wrapper" title="點擊檢視最新照片 / 一次存入所有未存">
         <img id="latestThumbImg" class="thumb-img" src="" alt="縮圖" style="display: none;">
         <div id="thumbPlaceholder" class="thumb-placeholder">🖼️</div>
+        <span id="pendingBadge" class="pending-badge" style="display:none;">0</span>
       </div>
 
       <button id="btnCapture" class="shutter-button" title="按下快門秒拍">
@@ -123,15 +124,21 @@
           </div>
 
           <div class="switch-row">
-            <label class="switch-label">拍照時自動下載到手機相簿：</label>
+            <label class="switch-label">拍照時自動下載到手機相簿（Android/桌機有效）：</label>
             <input type="checkbox" id="autoDownloadCheck">
           </div>
 
+          <div class="switch-row">
+            <label class="switch-label">存入相簿時同時包含「純淨原圖 B」：</label>
+            <input type="checkbox" id="includeCleanCheck" checked>
+          </div>
+
           <div class="tips-box">
-            <p>💡 <b>v9 升級重點：</b></p>
-            <p>1. <b>頂部按鈕恢復可點</b>：修掉 flexbox 把設定/翻轉按鈕擠出畫面的問題，iPhone 窄螢幕也能點到⚙️。</p>
-            <p>2. <b>鏡頭保護</b>：開預覽圖時主動暫停 video 讓出記憶體；關閉時清空預覽圖、強制 play()，必要時自動重啟相機，避免返回卡住。</p>
-            <p>3. <b>延續 v8</b>：iPhone 存檔走系統分享表、上傳走 1920px 縮圖、iOS 鎖住背景自動下載。</p>
+            <p>💡 <b>v10 升級重點（iPhone 連拍存檔全面重做）：</b></p>
+            <p>1. <b>連拍批次存</b>：每拍一張自動進「待存佇列」，左下縮圖右上顯示未存張數。點縮圖→💾 一次把全部未存送進 iOS 分享表，按「儲存 N 個影像」全部進相簿。</p>
+            <p>2. <b>第 2 勾選鈕解鎖</b>：現在可以自選「存相簿時要不要連純淨原圖 B 一起存」。不勾 → 只存打卡圖，一半檔案量。</p>
+            <p>3. <b>鏡頭硬救</b>：關閉預覽後主動檢查 video 是否真的在跑，一有異常立即重建串流，不再卡死。</p>
+            <p>4. <b>iPhone 真相</b>：iOS 禁止網頁背景自動存相簿（只允許使用者親手點），所以第 1 個「自動下載」在 iPhone 上就是沒用，這不是 bug 是 Apple 政策。請用批次存。</p>
           </div>
         </div>
         <div class="modal-footer">
@@ -141,6 +148,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=9"></script>
+  <script src="app.js?v=10"></script>
 </body>
 </html>
