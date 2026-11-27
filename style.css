@@ -33,16 +33,41 @@ html, body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 14px;
+  padding: 8px 10px;
   background: rgba(18, 18, 18, 0.98);
   border-bottom: 1px solid #282828;
   z-index: 20;
+  gap: 6px;
+  flex-wrap: nowrap;
 }
 
 .title-section {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.app-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* v9 修復：確保設定/翻轉按鈕永遠不被擠出畫面 */
+.top-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+}
+
+/* 窄螢幕（iPhone）隱藏版本標籤，把寶貴的橫向空間讓給功能按鈕 */
+@media (max-width: 480px) {
+  .version-tag { display: none; }
+  #cloudSyncBadge { max-width: 86px; overflow: hidden; }
 }
 
 .app-icon {

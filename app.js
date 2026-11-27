@@ -587,12 +587,24 @@ function openPreviewModal() {
     return;
   }
   state.activeTab = "stamped";
+  // v9：iOS 一次解碼大圖 + 鏡頭串流會爆記憶體，先暫停 video 讓出資源
+  if (isIOS && dom.cameraVideo) {
+    try { dom.cameraVideo.pause(); } catch (e) {}
+  }
   updatePreviewModalContent();
   dom.previewModal.style.display = "flex";
 }
 
 function closePreviewModal() {
   dom.previewModal.style.display = "none";
+  // v9：關閉預覽時清空 src 釋放大圖記憶體，再強制讓鏡頭恢復播放
+  try { dom.previewImg.removeAttribute("src"); } catch (e) {}
+  if (dom.cameraVideo && dom.cameraVideo.srcObject) {
+    dom.cameraVideo.play().catch((err) => {
+      console.warn("恢復鏡頭播放失敗，重啟串流：", err);
+      startCamera();
+    });
+  }
 }
 
 function updatePreviewModalContent() {

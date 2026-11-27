@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>旅遊足跡隨手拍 - iOS 設定按鈕與鏡頭保護修復 (v9)</title>
+  <link rel="stylesheet" href="style.css?v=9">
+</head>
+<body>
+  <div class="app-container">
+    <header class="top-bar">
+      <div class="title-section">
+        <span class="app-icon">📷</span>
+        <h1 class="app-title">旅遊相機 <span class="version-tag">v9</span></h1>
+      </div>
+
+      <div id="cloudSyncBadge" class="sync-badge idle" title="雲端同步狀態">
+        <span class="sync-icon">☁️</span>
+        <span id="syncText" class="sync-text">已連線</span>
+      </div>
+
+      <div class="top-actions">
+        <button id="btnSwitchCamera" class="icon-button" title="切換前後鏡頭">🔄 翻轉</button>
+        <button id="btnSettings" class="icon-button" title="雲端硬碟設定">⚙️ 設定</button>
+      </div>
+    </header>
+
+    <div class="trip-bar">
+      <label for="tripTitleInput" class="trip-label">🎒 主題：</label>
+      <input type="text" id="tripTitleInput" class="trip-input" value="2026 歡樂旅遊紀錄" placeholder="輸入本次旅行名稱">
+    </div>
+
+    <div class="status-card">
+      <div class="status-row">
+        <span class="status-indicator" id="gpsIndicator"></span>
+        <span class="status-text" id="gpsStatus">正在搜尋衛星定位...</span>
+        <span id="resolutionBadge" class="resolution-badge" style="display:none;">—</span>
+      </div>
+      <div class="address-row" id="addressDisplay">門牌地址載入中...</div>
+    </div>
+
+    <main class="viewport-area" id="viewportArea">
+      <video id="cameraVideo" autoplay playsinline webkit-playsinline muted class="camera-stream"></video>
+
+      <div class="grid-overlay">
+        <div class="grid-line horizontal h1"></div>
+        <div class="grid-line horizontal h2"></div>
+        <div class="grid-line vertical v1"></div>
+        <div class="grid-line vertical v2"></div>
+      </div>
+
+      <div id="zoomPanel" class="zoom-panel" style="display:none;">
+        <button id="btnZoomOut" class="zoom-btn" title="縮小">−</button>
+        <input id="zoomSlider" class="zoom-slider" type="range" min="1" max="4" step="0.1" value="1">
+        <button id="btnZoomIn" class="zoom-btn" title="放大">+</button>
+        <span id="zoomValue" class="zoom-value">1.0x</span>
+      </div>
+
+      <div id="cameraPromptOverlay" class="camera-prompt-overlay">
+        <div class="prompt-icon">📸</div>
+        <div class="prompt-title">相機鏡頭準備中</div>
+        <div class="prompt-desc">請輕碰下方按鈕，並點選「允許相機」即可開始取景！</div>
+        <button id="btnStartCameraManual" class="btn primary-btn prompt-btn">🚀 啟動相機畫面</button>
+      </div>
+
+      <div id="shutterFlash" class="shutter-flash"></div>
+      <div id="quickToast" class="quick-toast">✓ 已拍下，背景傳送中</div>
+
+      <canvas id="cleanCanvas" style="display: none;"></canvas>
+      <canvas id="stampedCanvas" style="display: none;"></canvas>
+
+      <div id="previewModal" class="modal-overlay" style="display: none;">
+        <div class="modal-box preview-modal-box">
+          <div class="preview-tabs">
+            <button id="tabStamped" class="tab-btn active">打卡印章圖 (A)</button>
+            <button id="tabClean" class="tab-btn">純淨原圖 (B)</button>
+            <button id="btnClosePreview" class="close-tab-btn" title="關閉檢視">&times;</button>
+          </div>
+          <div class="preview-image-wrapper">
+            <img id="previewImg" src="" alt="照片預覽" class="preview-img">
+          </div>
+          <div class="modal-footer preview-footer">
+            <button id="btnSaveLocal" class="btn primary-btn">💾 存入手機相簿</button>
+            <button id="btnForceUpload" class="btn secondary-btn">☁️ 重新立即同步</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="bottom-controls" id="cameraControls">
+      <div id="thumbnailContainer" class="thumbnail-wrapper" title="點擊檢視最新照片">
+        <img id="latestThumbImg" class="thumb-img" src="" alt="縮圖" style="display: none;">
+        <div id="thumbPlaceholder" class="thumb-placeholder">🖼️</div>
+      </div>
+
+      <button id="btnCapture" class="shutter-button" title="按下快門秒拍">
+        <div class="shutter-outer">
+          <div class="shutter-inner"></div>
+        </div>
+      </button>
+
+      <button id="btnRefreshGps" class="side-control-btn" title="重新抓取目前位置">
+        <span class="control-icon">📍</span>
+        <span class="control-text">重整定位</span>
+      </button>
+    </footer>
+
+    <div id="settingsModal" class="modal-overlay" style="display: none;">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h2>Google 雲端硬碟同步設定</h2>
+          <button id="btnCloseSettings" class="close-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="modal-desc">
+            您的專屬接收小幫手 (Google Apps Script) 網址：
+          </p>
+          <input type="url" id="gasUrlInput" class="modal-input" placeholder="https://script.google.com/macros/s/.../exec">
+
+          <div class="switch-row">
+            <label class="switch-label">啟用背景默默同步：</label>
+            <input type="checkbox" id="autoUploadCheck" checked>
+          </div>
+
+          <div class="switch-row">
+            <label class="switch-label">拍照時自動下載到手機相簿：</label>
+            <input type="checkbox" id="autoDownloadCheck">
+          </div>
+
+          <div class="tips-box">
+            <p>💡 <b>v9 升級重點：</b></p>
+            <p>1. <b>頂部按鈕恢復可點</b>：修掉 flexbox 把設定/翻轉按鈕擠出畫面的問題，iPhone 窄螢幕也能點到⚙️。</p>
+            <p>2. <b>鏡頭保護</b>：開預覽圖時主動暫停 video 讓出記憶體；關閉時清空預覽圖、強制 play()，必要時自動重啟相機，避免返回卡住。</p>
+            <p>3. <b>延續 v8</b>：iPhone 存檔走系統分享表、上傳走 1920px 縮圖、iOS 鎖住背景自動下載。</p>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="btnSaveSettings" class="btn primary-btn">儲存設定</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=9"></script>
+</body>
+</html>

@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>旅遊足跡隨手拍 - iOS 相簿存檔修復版 (v8)</title>
-  <link rel="stylesheet" href="style.css?v=8">
+  <title>旅遊足跡隨手拍 - iOS 設定按鈕與鏡頭保護修復 (v9)</title>
+  <link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
   <div class="app-container">
     <header class="top-bar">
       <div class="title-section">
         <span class="app-icon">📷</span>
-        <h1 class="app-title">旅遊相機 <span class="version-tag">v8 iOS 存檔修復</span></h1>
+        <h1 class="app-title">旅遊相機 <span class="version-tag">v9</span></h1>
       </div>
 
       <div id="cloudSyncBadge" class="sync-badge idle" title="雲端同步狀態">
@@ -128,10 +128,10 @@
           </div>
 
           <div class="tips-box">
-            <p>💡 <b>v8 升級重點：</b></p>
-            <p>1. <b>iPhone 存檔走系統分享表</b>：點縮圖開預覽後按「💾 存入手機相簿」，iOS 會彈出原生分享表，選「儲存影像」就能進照片 App，不會再中斷鏡頭。</p>
-            <p>2. <b>上傳提速</b>：上傳到雲端的圖自動縮到 1920px/0.82 品質（約 300~500KB/張），GAS 傳輸速度大幅提升；手機本地仍保留原生最大畫素高品質版本。</p>
-            <p>3. <b>iPhone 停用自動下載</b>：iOS 根本不支援背景存相簿，自動下載只會打斷鏡頭，v8 自動鎖住此選項。</p>
+            <p>💡 <b>v9 升級重點：</b></p>
+            <p>1. <b>頂部按鈕恢復可點</b>：修掉 flexbox 把設定/翻轉按鈕擠出畫面的問題，iPhone 窄螢幕也能點到⚙️。</p>
+            <p>2. <b>鏡頭保護</b>：開預覽圖時主動暫停 video 讓出記憶體；關閉時清空預覽圖、強制 play()，必要時自動重啟相機，避免返回卡住。</p>
+            <p>3. <b>延續 v8</b>：iPhone 存檔走系統分享表、上傳走 1920px 縮圖、iOS 鎖住背景自動下載。</p>
           </div>
         </div>
         <div class="modal-footer">
@@ -141,6 +141,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>
