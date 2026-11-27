@@ -1,26 +1,24 @@
 /**
- * 旅遊足跡相機核心控制腳本 (v6 最大畫素與縮放控制版)
+ * 旅遊足跡相機核心控制腳本 (v7 iOS 連拍修復 + 非阻塞編碼版)
  *
- * v6 新增重點（相較 v5）：
- * 1. 自動探測裝置鏡頭的「最大支援解析度」：先用一般請求開啟鏡頭，再透過
- *    track.getCapabilities() 讀出 width/height 上限，然後重新 applyConstraints
- *    把解析度拉到裝置極限（例如 4000×3000、4032×3024 等），讓照片畫質大幅提升。
- * 2. 縮放控制（Zoom）：
- *    - 若裝置支援原生 zoom（多數 Android Chrome、部分 iOS Safari 16+），直接
- *      透過 MediaStreamTrack applyConstraints 控制光學／原生數位變焦。
- *    - 不支援的裝置退回「Canvas 裁切數位縮放」，預覽用 CSS transform，拍攝時
- *      用 Canvas 中心裁切保留原始畫素，避免放大失真。
- * 3. 拍照不再強制縮小到 1920px，而是用「原生解析度」存檔，JPEG 品質提升到 0.95。
- * 4. 介面新增縮放滑桿與目前倍率顯示，雙指捏合手勢也會同步調整。
+ * v7 相較 v6 的四大修復（專治 iPhone Chrome/Safari 無法連拍）：
+ * 1. 編碼非同步化：改用 canvas.toBlob() 取代 canvas.toDataURL()，JPEG 編碼
+ *    丟到瀏覽器背景執行緒，主執行緒不再阻塞，快門按下後 50ms 內即可按下一張。
+ * 2. iOS 安全解析度上限：偵測 iOS 時，最大邊長壓到 2560px，避免 WebView
+ *    記憶體爆掉導致鏡頭串流被系統回收。
+ * 3. 每張獨立 Canvas：每次拍照都 new 一組 OffscreenCanvas / document.createElement
+ *    避免 v6 單一共用 canvas 被連拍覆蓋造成資料損毀。
+ * 4. applyConstraints 走 iOS 相容語法：改用 { width: { ideal } } 單層格式，
+ *    不用 advanced: [{ … }]；失敗時優雅退場不影響拍照。
+ * 5. 預覽改走 ObjectURL：縮圖與預覽彈窗使用 URL.createObjectURL(blob)，
+ *    體積 0 且 GC 友善；base64 僅在上傳 Google Drive 那一刻才現場轉。
  */
 
-// 1. 全域狀態管理
 const state = {
   latitude: null,
   longitude: null,
   accuracy: null,
   address: "定位準備中...",
-  currentTimestamp: "",
   activeTab: "stamped",
   mediaStream: null,
   currentTrack: null,
@@ -29,7 +27,6 @@ const state = {
   autoUpload: localStorage.getItem("travel_camera_auto_upload") !== "false",
   autoDownload: localStorage.getItem("travel_camera_auto_download") === "true",
 
-  // 相機能力資訊（由 getCapabilities 取得）
   cameraCaps: {
     maxWidth: 0,
     maxHeight: 0,
@@ -41,22 +38,20 @@ const state = {
     zoomStep: 0.1
   },
 
-  // 當前縮放倍率（原生 zoom 或數位倍率皆沿用此值）
   currentZoom: 1,
 
-  // 背景上傳佇列系統
   uploadQueue: [],
   isUploading: false,
-
-  // 目前檢視的照片快取
   currentViewingPhoto: null
 };
 
-// v6 不再硬性限制最大邊長；用 null 代表「原生解析度存檔」
-const MAX_IMAGE_DIMENSION = null;
-const JPEG_QUALITY = 0.95;
+// 1. iOS / 裝置偵測與安全上限
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+              (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const IOS_SAFE_MAX_DIM = 2560;     // iPhone WebKit 單張安全上限
+const ANDROID_SAFE_MAX_DIM = 4096; // Android Chrome 可承受更高
+const JPEG_QUALITY = isIOS ? 0.90 : 0.92;
 
-// 2. DOM 元素快取
 const dom = {
   gpsIndicator: document.getElementById("gpsIndicator"),
   gpsStatus: document.getElementById("gpsStatus"),
@@ -70,8 +65,6 @@ const dom = {
   quickToast: document.getElementById("quickToast"),
   cloudSyncBadge: document.getElementById("cloudSyncBadge"),
   syncText: document.getElementById("syncText"),
-  cleanCanvas: document.getElementById("cleanCanvas"),
-  stampedCanvas: document.getElementById("stampedCanvas"),
   btnCapture: document.getElementById("btnCapture"),
   btnRefreshGps: document.getElementById("btnRefreshGps"),
   btnSettings: document.getElementById("btnSettings"),
@@ -82,7 +75,6 @@ const dom = {
   autoUploadCheck: document.getElementById("autoUploadCheck"),
   autoDownloadCheck: document.getElementById("autoDownloadCheck"),
 
-  // 縮圖與預覽彈窗
   thumbnailContainer: document.getElementById("thumbnailContainer"),
   latestThumbImg: document.getElementById("latestThumbImg"),
   thumbPlaceholder: document.getElementById("thumbPlaceholder"),
@@ -94,7 +86,6 @@ const dom = {
   btnSaveLocal: document.getElementById("btnSaveLocal"),
   btnForceUpload: document.getElementById("btnForceUpload"),
 
-  // v6 新增：解析度與縮放 UI
   resolutionBadge: document.getElementById("resolutionBadge"),
   zoomPanel: document.getElementById("zoomPanel"),
   zoomSlider: document.getElementById("zoomSlider"),
@@ -103,7 +94,6 @@ const dom = {
   btnZoomIn: document.getElementById("btnZoomIn")
 };
 
-// 3. 網頁啟動初始化
 window.addEventListener("DOMContentLoaded", () => {
   initSettings();
   initGeolocation();
@@ -117,19 +107,19 @@ function initSettings() {
   dom.autoDownloadCheck.checked = state.autoDownload;
 }
 
-// 4. 相機啟動（兩段式：先開啟 → 再拉到最大解析度）
+// 2. 相機啟動（iOS 相容語法）
 async function startCamera() {
   stopCamera();
   let stream = null;
-
-  // 第一階段：先用相對寬鬆的條件開啟鏡頭，確保能拿到串流
   const facing = state.currentFacingMode;
+  const safeMax = isIOS ? IOS_SAFE_MAX_DIM : ANDROID_SAFE_MAX_DIM;
+
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: facing },
-        width: { ideal: 4096 },
-        height: { ideal: 4096 }
+        width: { ideal: safeMax },
+        height: { ideal: safeMax }
       },
       audio: false
     });
@@ -153,10 +143,7 @@ async function startCamera() {
   state.mediaStream = stream;
   state.currentTrack = stream.getVideoTracks()[0];
 
-  // 第二階段：讀出裝置最大畫素，再 applyConstraints 推到極限
-  await applyMaxResolution(state.currentTrack);
-
-  // 第三階段：探測縮放能力並刷新 UI
+  await applySafeMaxResolution(state.currentTrack);
   detectZoomCapability(state.currentTrack);
   refreshResolutionBadge();
 
@@ -173,18 +160,27 @@ async function startCamera() {
   };
 }
 
-async function applyMaxResolution(track) {
+async function applySafeMaxResolution(track) {
   if (!track || typeof track.getCapabilities !== "function") return;
   try {
     const caps = track.getCapabilities();
-    const maxW = caps.width && caps.width.max ? caps.width.max : 0;
-    const maxH = caps.height && caps.height.max ? caps.height.max : 0;
+    let maxW = caps.width && caps.width.max ? caps.width.max : 0;
+    let maxH = caps.height && caps.height.max ? caps.height.max : 0;
     state.cameraCaps.maxWidth = maxW;
     state.cameraCaps.maxHeight = maxH;
 
+    const safeMax = isIOS ? IOS_SAFE_MAX_DIM : ANDROID_SAFE_MAX_DIM;
+    if (maxW > safeMax || maxH > safeMax) {
+      const ratio = Math.min(safeMax / maxW, safeMax / maxH);
+      maxW = Math.round(maxW * ratio);
+      maxH = Math.round(maxH * ratio);
+    }
+
     if (maxW && maxH) {
+      // iOS 相容：走單層 ideal，不用 advanced
       await track.applyConstraints({
-        advanced: [{ width: maxW, height: maxH }]
+        width: { ideal: maxW },
+        height: { ideal: maxH }
       });
     }
   } catch (err) {
@@ -216,7 +212,6 @@ function detectZoomCapability(track) {
     state.currentZoom = caps.zoom.min;
     setupNativeZoomUI();
   } else {
-    // 不支援原生 zoom，退回數位裁切變焦（1x–4x）
     state.cameraCaps.zoomMin = 1;
     state.cameraCaps.zoomMax = 4;
     state.cameraCaps.zoomStep = 0.1;
@@ -234,7 +229,6 @@ function setupNativeZoomUI() {
   dom.zoomSlider.value = String(state.currentZoom);
   updateZoomLabel();
   dom.cameraVideo.style.transform = "";
-  dom.cameraVideo.style.transformOrigin = "center center";
 }
 
 function setupDigitalZoomUI() {
@@ -270,7 +264,6 @@ async function setZoom(value) {
 }
 
 function applyDigitalZoomPreview() {
-  // 數位縮放只放大預覽；拍照時用 Canvas 裁切保留原始畫素
   const z = state.currentZoom;
   dom.cameraVideo.style.transformOrigin = "center center";
   dom.cameraVideo.style.transform = `scale(${z})`;
@@ -303,7 +296,7 @@ function switchCamera() {
   startCamera();
 }
 
-// 5. 定位與地址解析（沿用 v5）
+// 3. 定位
 function initGeolocation() {
   if (!navigator.geolocation) {
     updateGpsUI(false, "手機不支援定位功能");
@@ -364,7 +357,7 @@ function formatAddress(data) {
   return full.trim() || data.display_name;
 }
 
-// 6. 零延遲秒拍 + 原生解析度存檔
+// 4. ★ 核心：非阻塞連拍引擎 ★
 function capturePhotoInstantly() {
   const video = dom.cameraVideo;
   if (!video.videoWidth || !video.videoHeight) {
@@ -375,16 +368,20 @@ function capturePhotoInstantly() {
   if (navigator.vibrate) navigator.vibrate(40);
   triggerShutterFlash();
 
-  const timestampStr = formatFullDate(new Date());
-  const currentAddress = state.address;
-  const currentLat = state.latitude;
-  const currentLon = state.longitude;
-  const currentTripTitle = dom.tripTitleInput.value.trim() || "旅遊隨手拍";
+  // (A) 鎖定當下所有情境資料（避免下一張覆蓋）
+  const snapshot = {
+    id: Date.now() + Math.random(),
+    tripTitle: dom.tripTitleInput.value.trim() || "旅遊隨手拍",
+    timestamp: formatFullDate(new Date()),
+    address: state.address,
+    latitude: state.latitude,
+    longitude: state.longitude
+  };
 
   const origW = video.videoWidth;
   const origH = video.videoHeight;
 
-  // 計算來源裁切（只在數位縮放時啟用，光學縮放時交給硬體處理）
+  // (B) 計算裁切窗（數位縮放時從中心取）
   const useDigitalZoom = !state.cameraCaps.supportsNativeZoom && state.currentZoom > 1.01;
   let srcX = 0, srcY = 0, srcW = origW, srcH = origH;
   if (useDigitalZoom) {
@@ -395,77 +392,103 @@ function capturePhotoInstantly() {
     srcY = Math.round((origH - srcH) / 2);
   }
 
-  // v6：輸出目標尺寸 = 來源尺寸（原生畫素，不再縮水）
-  const targetW = srcW;
-  const targetH = srcH;
+  // (C) ★ 每次拍照獨立 canvas，不共用，連拍不互相覆蓋 ★
+  const cleanCanvas = document.createElement("canvas");
+  const stampedCanvas = document.createElement("canvas");
+  cleanCanvas.width = srcW;
+  cleanCanvas.height = srcH;
+  stampedCanvas.width = srcW;
+  stampedCanvas.height = srcH;
 
-  // 版本 B：純淨原圖
-  const cleanCanvas = dom.cleanCanvas;
-  cleanCanvas.width = targetW;
-  cleanCanvas.height = targetH;
-  const cleanCtx = cleanCanvas.getContext("2d");
-  cleanCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, targetW, targetH);
-  const cleanDataUrl = cleanCanvas.toDataURL("image/jpeg", JPEG_QUALITY);
+  // (D) 繪製（同步，但速度很快 ~5-30ms）
+  cleanCanvas.getContext("2d").drawImage(video, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+  const sCtx = stampedCanvas.getContext("2d");
+  sCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+  drawTravelStamp(sCtx, srcW, srcH, snapshot.tripTitle, snapshot.address, snapshot.timestamp, snapshot.latitude, snapshot.longitude);
 
-  // 版本 A：打卡印章圖
-  const stampedCanvas = dom.stampedCanvas;
-  stampedCanvas.width = targetW;
-  stampedCanvas.height = targetH;
-  const stampedCtx = stampedCanvas.getContext("2d");
-  stampedCtx.drawImage(video, srcX, srcY, srcW, srcH, 0, 0, targetW, targetH);
-  drawTravelStamp(stampedCtx, targetW, targetH, currentTripTitle, currentAddress, timestampStr, currentLat, currentLon);
-  const stampedDataUrl = stampedCanvas.toDataURL("image/jpeg", JPEG_QUALITY);
+  // (E) 立即給使用者回饋 → 快門可以馬上按下一張
+  const mp = ((srcW * srcH) / 1000000).toFixed(1);
+  showQuickToast(`✓ 已拍下 ${srcW}×${srcH} (${mp}MP)`);
 
-  // 立刻釋放畫布記憶體
-  cleanCanvas.width = 1;
-  cleanCanvas.height = 1;
-  stampedCanvas.width = 1;
-  stampedCanvas.height = 1;
+  // (F) ★ 非同步編碼：toBlob 走背景執行緒，不阻塞主線 ★
+  Promise.all([
+    canvasToBlob(cleanCanvas, "image/jpeg", JPEG_QUALITY),
+    canvasToBlob(stampedCanvas, "image/jpeg", JPEG_QUALITY)
+  ]).then(([cleanBlob, stampedBlob]) => {
+    const task = Object.assign({}, snapshot, {
+      width: srcW,
+      height: srcH,
+      cleanBlob,
+      stampedBlob,
+      cleanUrl: URL.createObjectURL(cleanBlob),
+      stampedUrl: URL.createObjectURL(stampedBlob)
+    });
 
-  const photoTask = {
-    id: Date.now(),
-    tripTitle: currentTripTitle,
-    timestamp: timestampStr,
-    address: currentAddress,
-    latitude: currentLat,
-    longitude: currentLon,
-    width: targetW,
-    height: targetH,
-    cleanImageDataUrl: cleanDataUrl,
-    stampedImageDataUrl: stampedDataUrl
-  };
+    updateLatestThumbnail(task);
 
-  updateLatestThumbnail(photoTask);
-  const mp = ((targetW * targetH) / 1000000).toFixed(1);
-  showQuickToast(`✓ 已拍下 ${targetW}×${targetH} (${mp}MP)`);
-
-  if (state.autoDownload) {
-    saveTaskToLocal(photoTask, false);
-  }
-  if (state.autoUpload && state.gasUrl) {
-    state.uploadQueue.push(photoTask);
-    triggerBackgroundUploader();
-  }
+    if (state.autoDownload) saveTaskToLocal(task, false);
+    if (state.autoUpload && state.gasUrl) {
+      state.uploadQueue.push(task);
+      triggerBackgroundUploader();
+    }
+  }).catch(err => {
+    console.error("編碼失敗：", err);
+    showQuickToast("⚠️ 編碼失敗，請再按一次");
+  });
 }
 
-// 7. 背景佇列上傳（沿用 v5）
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve, reject) => {
+    if (canvas.toBlob) {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error("toBlob 回傳 null"));
+      }, type, quality);
+    } else {
+      // 極少數不支援 toBlob 的環境退回 toDataURL
+      try {
+        const dataUrl = canvas.toDataURL(type, quality);
+        fetch(dataUrl).then(r => r.blob()).then(resolve).catch(reject);
+      } catch (e) { reject(e); }
+    }
+  });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const s = r.result || "";
+      const comma = s.indexOf(",");
+      resolve(comma >= 0 ? s.slice(comma + 1) : s);
+    };
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+// 5. 背景佇列上傳（blob → base64 只在上傳當下才轉）
 async function triggerBackgroundUploader() {
   updateSyncBadge();
   if (state.isUploading) return;
   state.isUploading = true;
 
   while (state.uploadQueue.length > 0) {
-    const currentTask = state.uploadQueue[0];
+    const task = state.uploadQueue[0];
     updateSyncBadge();
     try {
+      const [cleanB64, stampedB64] = await Promise.all([
+        blobToBase64(task.cleanBlob),
+        blobToBase64(task.stampedBlob)
+      ]);
       const payload = {
-        tripTitle: currentTask.tripTitle,
-        timestamp: currentTask.timestamp,
-        address: currentTask.address,
-        latitude: currentTask.latitude,
-        longitude: currentTask.longitude,
-        cleanImageBase64: currentTask.cleanImageDataUrl.split(",")[1],
-        stampedImageBase64: currentTask.stampedImageDataUrl.split(",")[1]
+        tripTitle: task.tripTitle,
+        timestamp: task.timestamp,
+        address: task.address,
+        latitude: task.latitude,
+        longitude: task.longitude,
+        cleanImageBase64: cleanB64,
+        stampedImageBase64: stampedB64
       };
       const res = await fetch(state.gasUrl, {
         method: "POST",
@@ -503,10 +526,10 @@ function updateSyncBadge() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// 8. 縮圖與預覽
-function updateLatestThumbnail(photoTask) {
-  state.currentViewingPhoto = photoTask;
-  dom.latestThumbImg.src = photoTask.stampedImageDataUrl;
+// 6. 縮圖與預覽（改走 ObjectURL）
+function updateLatestThumbnail(task) {
+  state.currentViewingPhoto = task;
+  dom.latestThumbImg.src = task.stampedUrl;
   dom.latestThumbImg.style.display = "block";
   dom.thumbPlaceholder.style.display = "none";
 }
@@ -526,16 +549,16 @@ function closePreviewModal() {
 }
 
 function updatePreviewModalContent() {
-  const photo = state.currentViewingPhoto;
-  if (!photo) return;
+  const t = state.currentViewingPhoto;
+  if (!t) return;
   if (state.activeTab === "stamped") {
     dom.tabStamped.classList.add("active");
     dom.tabClean.classList.remove("active");
-    dom.previewImg.src = photo.stampedImageDataUrl;
+    dom.previewImg.src = t.stampedUrl;
   } else {
     dom.tabClean.classList.add("active");
     dom.tabStamped.classList.remove("active");
-    dom.previewImg.src = photo.cleanImageDataUrl;
+    dom.previewImg.src = t.cleanUrl;
   }
 }
 
@@ -546,23 +569,26 @@ function saveCurrentViewingToLocal() {
 
 function saveTaskToLocal(task, showAlert) {
   const timeStr = task.timestamp.replace(/[: /]/g, "_");
-  downloadDataUrl(task.stampedImageDataUrl, `打卡印章_${timeStr}.jpg`);
-  setTimeout(() => downloadDataUrl(task.cleanImageDataUrl, `純淨原圖_${timeStr}.jpg`), 300);
+  downloadBlob(task.stampedBlob, `打卡印章_${timeStr}.jpg`);
+  setTimeout(() => downloadBlob(task.cleanBlob, `純淨原圖_${timeStr}.jpg`), 300);
   if (showAlert) {
     alert("已成功將【打卡印章圖】與【純淨原圖】存入手機相簿！");
   }
 }
 
-function downloadDataUrl(url, name) {
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+  // 2 秒後釋放 URL
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-// 9. 繪圖工具
+// 7. 繪圖與輔助
 function triggerShutterFlash() {
   dom.shutterFlash.classList.add("flash");
   setTimeout(() => dom.shutterFlash.classList.remove("flash"), 90);
@@ -631,7 +657,7 @@ function drawRoundRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-// 10. 事件綁定
+// 8. 事件綁定
 let pinchStartDist = 0;
 let pinchStartZoom = 1;
 
@@ -665,12 +691,10 @@ function initEventHandlers() {
   dom.btnCloseSettings.addEventListener("click", () => dom.settingsModal.style.display = "none");
   dom.btnSaveSettings.addEventListener("click", saveSettings);
 
-  // v6 縮放控制
   dom.zoomSlider.addEventListener("input", (e) => setZoom(e.target.value));
   dom.btnZoomIn.addEventListener("click", () => setZoom(state.currentZoom + state.cameraCaps.zoomStep));
   dom.btnZoomOut.addEventListener("click", () => setZoom(state.currentZoom - state.cameraCaps.zoomStep));
 
-  // 雙指捏合縮放
   const vp = document.getElementById("viewportArea");
   vp.addEventListener("touchstart", (e) => {
     if (e.touches.length === 2) {
